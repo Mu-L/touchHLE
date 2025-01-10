@@ -21,6 +21,7 @@ pub mod cf_array;
 pub mod cf_bundle;
 pub mod cf_data;
 pub mod cf_dictionary;
+pub mod cf_locale;
 pub mod cf_run_loop;
 pub mod cf_run_loop_timer;
 pub mod cf_string;
@@ -30,12 +31,15 @@ pub mod time;
 
 pub use cf_type::{CFRelease, CFRetain, CFTypeRef};
 
+pub type CFHashCode = u32;
 pub type CFIndex = i32;
 pub type CFOptionFlags = u32;
 
 use crate::abi::GuestArg;
 use crate::impl_GuestRet_for_large_struct;
 use crate::mem::SafeRead;
+
+pub const kCFNotFound: CFIndex = -1;
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C, packed)]

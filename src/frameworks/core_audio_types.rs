@@ -23,7 +23,7 @@ pub fn debug_fourcc(fourcc: u32) -> String {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 #[repr(C, packed)]
 pub struct AudioStreamBasicDescription {
     // Hz
@@ -89,3 +89,4 @@ pub const kAudioFormatFlagIsFloat: AudioFormatFlags = 1 << 0;
 pub const kAudioFormatFlagIsBigEndian: AudioFormatFlags = 1 << 1;
 pub const kAudioFormatFlagIsSignedInteger: AudioFormatFlags = 1 << 2;
 pub const kAudioFormatFlagIsPacked: AudioFormatFlags = 1 << 3;
+pub const kAudioFormatFlagIsAlignedHigh: AudioFormatFlags = 1 << 4;

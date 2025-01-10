@@ -7,11 +7,26 @@
 use crate::dyld::FunctionExports;
 use crate::environment::Environment;
 use crate::export_c_func;
-use crate::mem::{ConstVoidPtr, MutVoidPtr};
+use crate::libc::errno::set_errno;
+use crate::mem::{ConstVoidPtr, MutVoidPtr, Ptr};
 
-fn sigaction(_env: &mut Environment, signum: i32, act: ConstVoidPtr, oldact: MutVoidPtr) -> i32 {
+fn sigaction(env: &mut Environment, signum: i32, act: ConstVoidPtr, oldact: MutVoidPtr) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log!("TODO: sigaction({:?}, {:?}, {:?})", signum, act, oldact);
     0
 }
 
-pub const FUNCTIONS: FunctionExports = &[export_c_func!(sigaction(_, _, _))];
+fn signal(env: &mut Environment, signum: i32, handler: MutVoidPtr) -> MutVoidPtr {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    log!("TODO: signal({:?}, {:?})", signum, handler);
+    Ptr::null()
+}
+
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(sigaction(_, _, _)),
+    export_c_func!(signal(_, _)),
+];

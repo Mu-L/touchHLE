@@ -7,7 +7,7 @@
 //! very long and frequently-updated list.
 
 use crate::frameworks::{
-    core_foundation, core_graphics, foundation, media_player, opengles, uikit,
+    core_animation, core_foundation, core_graphics, foundation, media_player, opengles, uikit,
 };
 use crate::libc;
 
@@ -15,17 +15,27 @@ use crate::libc;
 pub const CONSTANT_LISTS: &[super::ConstantExports] = &[
     libc::ctype::CONSTANTS,
     libc::stdio::CONSTANTS,
+    libc::mach_init::CONSTANTS,
+    core_animation::ca_animation::CONSTANTS,
+    core_animation::ca_layer::CONSTANTS,
+    core_animation::ca_media_timing_function::CONSTANTS,
     core_foundation::cf_allocator::CONSTANTS,
+    core_foundation::cf_bundle::CONSTANTS,
+    core_foundation::cf_dictionary::CONSTANTS,
     core_foundation::cf_run_loop::CONSTANTS,
     core_graphics::cg_affine_transform::CONSTANTS,
     core_graphics::cg_color_space::CONSTANTS,
     core_graphics::cg_geometry::CONSTANTS,
     foundation::ns_error::CONSTANTS,
     foundation::ns_exception::CONSTANTS,
+    foundation::ns_file_manager::CONSTANTS,
     foundation::ns_keyed_unarchiver::CONSTANTS,
     foundation::ns_locale::CONSTANTS,
     foundation::ns_run_loop::CONSTANTS,
     media_player::movie_player::CONSTANTS,
+    media_player::music_player::CONSTANTS,
     opengles::eagl::CONSTANTS,
+    uikit::ui_application::CONSTANTS,
     uikit::ui_device::CONSTANTS,
+    uikit::ui_view::ui_window::CONSTANTS,
 ];

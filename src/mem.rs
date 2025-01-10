@@ -119,7 +119,11 @@ impl<T, const MUT: bool> Default for Ptr<T, MUT> {
 
 impl<T, const MUT: bool> std::fmt::Debug for Ptr<T, MUT> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:#x}", self.to_bits())
+        if self.is_null() {
+            write!(f, "(null)")
+        } else {
+            write!(f, "{:#x}", self.to_bits())
+        }
     }
 }
 
@@ -234,6 +238,13 @@ pub struct Mem {
     null_segment_size: VAddr,
 
     allocator: allocator::Allocator,
+
+    /// The flag to control if memory is zeroed out on free (`true`, default)
+    /// or on alloc (`false`).
+    ///
+    /// Right now only one game, Spore Origin, is setting this value to `false`
+    /// via a game-specific hack. See [crate::Environment] for more info.
+    pub(super) zero_memory_on_free: bool,
 }
 
 impl Drop for Mem {
@@ -257,7 +268,7 @@ impl Mem {
     pub const MAIN_THREAD_STACK_LOW_END: VAddr = 0u32.wrapping_sub(Self::MAIN_THREAD_STACK_SIZE);
 
     /// iPhone OS secondary thread stack size.
-    pub const SECONDARY_THREAD_STACK_SIZE: GuestUSize = 512 * 1024;
+    pub const SECONDARY_THREAD_DEFAULT_STACK_SIZE: GuestUSize = 512 * 1024;
 
     /// Create a fresh instance of guest memory.
     pub fn new() -> Mem {
@@ -271,6 +282,7 @@ impl Mem {
             bytes,
             null_segment_size: 0,
             allocator,
+            zero_memory_on_free: true,
         }
     }
 
@@ -284,6 +296,7 @@ impl Mem {
             bytes: _,
             null_segment_size: _,
             ref mut allocator,
+            ..
         } = mem;
         let used_chunks = allocator.reset_and_drain_used_chunks();
         for allocator::Chunk { base, size } in used_chunks {
@@ -378,6 +391,18 @@ impl Mem {
         }
         &self.bytes()[ptr.to_bits() as usize..][..count as usize]
     }
+    /// Get a slice for reading `count` bytes without a null-page check.
+    ///
+    /// This **doesn't** panic at access within the null page.
+    ///
+    /// You shall have a good reason to use it instead of [Self::bytes_at]
+    pub fn unchecked_bytes_at<const MUT: bool>(
+        &self,
+        ptr: Ptr<u8, MUT>,
+        count: GuestUSize,
+    ) -> &[u8] {
+        &self.bytes()[ptr.to_bits() as usize..][..count as usize]
+    }
     /// Get a slice for reading or writing `count` bytes. This is the basic
     /// primitive for safe read-write memory access.
     ///
@@ -410,6 +435,22 @@ impl Mem {
         let size = count.checked_mul(guest_size_of::<T>()).unwrap();
         self.bytes_at(ptr.cast(), size).as_ptr().cast()
     }
+    /// A variation of [Self::ptr_at] without a null-page check.
+    ///
+    /// This **doesn't** panic at access within the null page.
+    ///
+    /// You shall have a good reason to use it instead of [Self::ptr_at]
+    pub fn unchecked_ptr_at<T, const MUT: bool>(
+        &self,
+        ptr: Ptr<T, MUT>,
+        count: GuestUSize,
+    ) -> *const T
+    where
+        T: SafeRead,
+    {
+        let size = count.checked_mul(guest_size_of::<T>()).unwrap();
+        self.unchecked_bytes_at(ptr.cast(), size).as_ptr().cast()
+    }
     /// Get a pointer for reading or writing to an array of `count` elements of
     /// type `T`. Only use this for interfacing with unsafe C-like APIs.
     ///
@@ -427,6 +468,19 @@ impl Mem {
     {
         let size = count.checked_mul(guest_size_of::<T>()).unwrap();
         self.bytes_at_mut(ptr.cast(), size).as_mut_ptr().cast()
+    }
+
+    /// Transform a host pointer addressing a location in guest memory back into
+    /// a guest pointer. This exists solely to deal with OpenGL `glGetPointerv`.
+    /// You should never have another reason to use this.
+    ///
+    /// Panics if the host pointer is not addressing a location in guest memory.
+    pub fn host_ptr_to_guest_ptr(&self, host_ptr: *const std::ffi::c_void) -> ConstVoidPtr {
+        let host_ptr = host_ptr.cast::<u8>();
+        let guest_mem_range = self.bytes().as_ptr_range();
+        assert!(guest_mem_range.contains(&host_ptr));
+        let guest_addr = host_ptr as usize - guest_mem_range.start as usize;
+        Ptr::from_bits(u32::try_from(guest_addr).unwrap())
     }
 
     /// Read a value for memory. This is the preferred way to read memory in
@@ -468,11 +522,17 @@ impl Mem {
     /// Allocate `size` bytes.
     pub fn alloc(&mut self, size: GuestUSize) -> MutVoidPtr {
         let ptr = Ptr::from_bits(self.allocator.alloc(size));
+        if !self.zero_memory_on_free {
+            self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
         log_dbg!("Allocated {:?} ({:#x} bytes)", ptr, size);
         ptr
     }
 
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
+        if old_ptr.is_null() {
+            return self.alloc(size);
+        }
         // TODO: for a moment we always assume that we do not have enough size
         //       to realloc inplace
         let old_size = self.allocator.find_allocated_size(old_ptr.to_bits());
@@ -488,7 +548,9 @@ impl Mem {
     /// Free an allocation made with one of the `alloc` methods on this type.
     pub fn free(&mut self, ptr: MutVoidPtr) {
         let size = self.allocator.free(ptr.to_bits());
-        self.bytes_at_mut(ptr.cast(), size).fill(0);
+        if self.zero_memory_on_free {
+            self.bytes_at_mut(ptr.cast(), size).fill(0);
+        }
         log_dbg!("Freed {:?} ({:#x} bytes)", ptr, size);
     }
 

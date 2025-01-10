@@ -9,9 +9,11 @@ use crate::abi::{DotDotDot, VaList};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::foundation::{ns_string, unichar};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
-use crate::libc::posix_io::{STDERR_FILENO, STDOUT_FILENO};
-use crate::libc::stdio::FILE;
-use crate::libc::stdlib::atoi_inner;
+use crate::libc::errno::set_errno;
+use crate::libc::posix_io::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
+use crate::libc::stdio::{fwrite, FILE};
+use crate::libc::stdlib::{atof_inner, strtol_inner, strtoul};
+use crate::libc::string::strlen;
 use crate::libc::wchar::wchar_t;
 use crate::mem::{ConstPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{id, msg, nil};
@@ -73,27 +75,54 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
 
         let precision = if get_format_char(&env.mem, format_char_idx) == b'.' {
             format_char_idx += 1;
-            let mut precision = 0;
-            while let c @ b'0'..=b'9' = get_format_char(&env.mem, format_char_idx) {
-                precision = precision * 10 + (c - b'0') as usize;
+            let precision = if get_format_char(&env.mem, format_char_idx) == b'*' {
+                let precision = args.next::<i32>(env);
+                assert!(precision >= 0); // TODO: ignore negative
                 format_char_idx += 1;
-            }
+                precision as usize
+            } else {
+                let mut precision = 0;
+                while let c @ b'0'..=b'9' = get_format_char(&env.mem, format_char_idx) {
+                    precision = precision * 10 + (c - b'0') as usize;
+                    format_char_idx += 1;
+                }
+                precision
+            };
             Some(precision)
         } else {
             None
         };
 
-        let length_modifier = if get_format_char(&env.mem, format_char_idx) == b'l' {
-            format_char_idx += 1;
-            Some(b'l')
-        } else {
-            None
+        let length_modifier = match get_format_char(&env.mem, format_char_idx) {
+            b'l' => {
+                format_char_idx += 1;
+                if get_format_char(&env.mem, format_char_idx) == b'l' {
+                    format_char_idx += 1;
+                    Some("ll")
+                } else {
+                    Some("l")
+                }
+            }
+            // q seems to be an equivalent of 'll'
+            // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Strings/Articles/formatSpecifiers.html#//apple_ref/doc/uid/TP40004265-SW1
+            b'q' => {
+                format_char_idx += 1;
+                Some("ll")
+            }
+            _ => None,
         };
 
         let specifier = get_format_char(&env.mem, format_char_idx);
         format_char_idx += 1;
 
-        assert!(specifier != b'\0');
+        if specifier == b'\0' {
+            // Apparently, errno is not set in this case (tested on macOS),
+            // thus we treat this situation as a normal
+            // and just stop the formatting.
+            assert_eq!(b'%', get_format_char(&env.mem, format_char_idx - 2));
+            log!("printf_inner encountered '%' at the end of format string, ignoring.");
+            break;
+        }
         if specifier == b'%' {
             res.push(b'%');
             continue;
@@ -136,12 +165,33 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                     res.extend_from_slice("(null)".as_bytes());
                 }
             }
+            b'S' => {
+                // TODO: support length modifier
+                assert!(length_modifier.is_none());
+                // TODO: support other locales
+                let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
+                assert_eq!(env.mem.read(ctype_locale), b'C');
+                let w_string: ConstPtr<wchar_t> = args.next(env);
+                assert!(pad_char == ' ' && pad_width == 0); // TODO
+                if !w_string.is_null() {
+                    res.extend_from_slice(env.mem.wcstr_at(w_string).as_bytes());
+                } else {
+                    res.extend_from_slice("(null)".as_bytes());
+                }
+            }
             b'd' | b'i' | b'u' => {
                 // Note: on 32-bit system int and long are i32,
-                // so length_modifier is ignored
+                // so single length_modifier is ignored (but not double one!)
                 let int: i64 = if specifier == b'u' {
-                    let uint: u32 = args.next(env);
-                    uint.into()
+                    if length_modifier == Some("ll") {
+                        let uint: u64 = args.next(env);
+                        uint.try_into().unwrap()
+                    } else {
+                        let uint: u32 = args.next(env);
+                        uint.into()
+                    }
+                } else if length_modifier == Some("ll") {
+                    args.next(env)
                 } else {
                     let int: i32 = args.next(env);
                     int.into()
@@ -179,16 +229,36 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 }
             }
             b'x' => {
+                assert!(precision.is_none());
                 // Note: on 32-bit system unsigned int and unsigned long
                 // are u32, so length_modifier is ignored
                 let uint: u32 = args.next(env);
-                res.extend_from_slice(format!("{:x}", uint).as_bytes());
+                if pad_width > 0 {
+                    let pad_width = pad_width as usize;
+                    if pad_char == '0' && precision.is_none() {
+                        write!(&mut res, "{:0>1$x}", uint, pad_width).unwrap();
+                    } else {
+                        write!(&mut res, "{:>1$x}", uint, pad_width).unwrap();
+                    }
+                } else {
+                    res.extend_from_slice(format!("{:x}", uint).as_bytes());
+                }
             }
             b'X' => {
+                assert!(precision.is_none());
                 // Note: on 32-bit system unsigned int and unsigned long
                 // are u32, so length_modifier is ignored
                 let uint: u32 = args.next(env);
-                res.extend_from_slice(format!("{:X}", uint).as_bytes());
+                if pad_width > 0 {
+                    let pad_width = pad_width as usize;
+                    if pad_char == '0' && precision.is_none() {
+                        write!(&mut res, "{:0>1$X}", uint, pad_width).unwrap();
+                    } else {
+                        write!(&mut res, "{:>1$X}", uint, pad_width).unwrap();
+                    }
+                } else {
+                    res.extend_from_slice(format!("{:X}", uint).as_bytes());
+                }
             }
             b'p' => {
                 assert!(length_modifier.is_none());
@@ -323,7 +393,13 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                     formatted_f
                 };
 
-                res.extend_from_slice(result.as_bytes());
+                res.extend_from_slice(
+                    // TODO: skip if alternative representation is requested
+                    result
+                        .trim_end_matches('0')
+                        .trim_end_matches('.')
+                        .as_bytes(),
+                );
             }
             // TODO: more specifiers
             _ => unimplemented!(
@@ -346,10 +422,18 @@ fn snprintf(
     format: ConstPtr<u8>,
     args: DotDotDot,
 ) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    log_dbg!("snprintf() implemented as a wrapper of vsnprintf()");
+
     vsnprintf(env, dest, n, format, args.start())
 }
 
 fn vprintf(env: &mut Environment, format: ConstPtr<u8>, arg: VaList) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "vprintf({:?} ({:?}), ...)",
         format,
@@ -369,6 +453,9 @@ fn vsnprintf(
     format: ConstPtr<u8>,
     arg: VaList,
 ) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "vsnprintf({:?} {:?} {:?})",
         dest,
@@ -392,6 +479,9 @@ fn vsnprintf(
 }
 
 fn vsprintf(env: &mut Environment, dest: MutPtr<u8>, format: ConstPtr<u8>, arg: VaList) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "vsprintf({:?}, {:?} ({:?}), ...)",
         dest,
@@ -411,7 +501,26 @@ fn vsprintf(env: &mut Environment, dest: MutPtr<u8>, format: ConstPtr<u8>, arg: 
     res.len().try_into().unwrap()
 }
 
+fn __sprintf_chk(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    _flags: i32,
+    strlen: GuestUSize,
+    format: ConstPtr<u8>,
+    args: DotDotDot,
+) -> i32 {
+    if strlen == 0 {
+        panic!();
+    }
+    // TODO: respect flags level
+    // TODO: full overflow check
+    sprintf(env, dest, format, args)
+}
+
 fn sprintf(env: &mut Environment, dest: MutPtr<u8>, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "sprintf({:?}, {:?} ({:?}), ...)",
         dest,
@@ -438,13 +547,31 @@ fn swprintf(
     format: ConstPtr<wchar_t>,
     args: DotDotDot,
 ) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    log_dbg!("swprintf() implemented as a wrapper of vswprintf()");
+
+    vswprintf(env, ws, n, format, args.start())
+}
+
+fn vswprintf(
+    env: &mut Environment,
+    ws: MutPtr<wchar_t>,
+    n: GuestUSize,
+    format: ConstPtr<wchar_t>,
+    args: VaList,
+) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     // TODO: support other locales
     let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
     assert_eq!(env.mem.read(ctype_locale), b'C');
 
     let wcstr_format = env.mem.wcstr_at(format);
     log_dbg!(
-        "swprintf({:?}, {}, {:?} ({:?}), ...)",
+        "vswprintf({:?}, {}, {:?} ({:?}), ...)",
         ws,
         n,
         format,
@@ -462,7 +589,7 @@ fn swprintf(
                 wcstr_format_bytes[idx as usize]
             }
         },
-        args.start(),
+        args,
     );
 
     let to_write = n.min(res.len() as GuestUSize);
@@ -478,6 +605,9 @@ fn swprintf(
 }
 
 fn printf(env: &mut Environment, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "printf({:?} ({:?}), ...)",
         format,
@@ -511,12 +641,24 @@ fn sscanf_common(
             break;
         }
         if c != b'%' {
+            if isspace(env, format + format_char_idx - 1) && isspace(env, src_ptr.cast_const()) {
+                while isspace(env, src_ptr.cast_const()) {
+                    src_ptr += 1;
+                }
+                continue;
+            }
             let cc = env.mem.read(src_ptr);
             if c != cc {
                 return matched_args;
             }
             src_ptr += 1;
             continue;
+        }
+
+        let mut max_width: i32 = 0;
+        while let c @ b'0'..=b'9' = env.mem.read(format + format_char_idx) {
+            max_width = max_width * 10 + (c - b'0') as i32;
+            format_char_idx += 1;
         }
 
         let length_modifier = if env.mem.read(format + format_char_idx) == b'h' {
@@ -531,18 +673,23 @@ fn sscanf_common(
 
         match specifier {
             b'd' | b'i' => {
-                if specifier == b'i' {
-                    // TODO: hexs and octals
-                    assert_ne!(env.mem.read(src_ptr), b'0');
-                }
+                let base: u32 = if specifier == b'd' {
+                    10
+                } else {
+                    // automatic base detection in strtol
+                    0
+                };
 
                 match length_modifier {
                     Some(lm) => {
                         match lm {
                             b'h' => {
                                 // signed short* or unsigned short*
-                                match atoi_inner(env, src_ptr.cast_const()) {
+                                match strtol_inner(env, src_ptr.cast_const(), base) {
                                     Ok((val, len)) => {
+                                        if max_width > 0 {
+                                            assert_eq!(max_width, len as i32);
+                                        }
                                         src_ptr += len;
                                         let c_int_ptr: ConstPtr<i16> = args.next(env);
                                         env.mem
@@ -554,7 +701,7 @@ fn sscanf_common(
                             _ => unimplemented!(),
                         }
                     }
-                    _ => match atoi_inner(env, src_ptr.cast_const()) {
+                    _ => match strtol_inner(env, src_ptr.cast_const(), base) {
                         Ok((val, len)) => {
                             src_ptr += len;
                             let c_int_ptr: ConstPtr<i32> = args.next(env);
@@ -564,7 +711,30 @@ fn sscanf_common(
                     },
                 }
             }
+            b'f' => {
+                assert_eq!(max_width, 0);
+                assert!(length_modifier.is_none());
+                match atof_inner(env, src_ptr.cast_const()) {
+                    Ok((val, len)) => {
+                        src_ptr += len;
+                        let c_int_ptr: ConstPtr<f32> = args.next(env);
+                        env.mem.write(c_int_ptr.cast_mut(), val as f32);
+                    }
+                    Err(_) => break,
+                }
+            }
+            b'x' | b'X' => {
+                let c_len: GuestUSize = strlen(env, src_ptr.cast_const());
+                if max_width != 0 {
+                    assert_eq!(c_len, max_width.try_into().unwrap());
+                }
+                let val: u32 = strtoul(env, src_ptr.cast_const(), Ptr::null(), 16);
+                src_ptr += c_len;
+                let c_u32_ptr: ConstPtr<u32> = args.next(env);
+                env.mem.write(c_u32_ptr.cast_mut(), val);
+            }
             b'[' => {
+                assert_eq!(max_width, 0);
                 assert!(length_modifier.is_none());
                 // TODO: support ranges like [0-9]
                 // [set] case
@@ -597,6 +767,21 @@ fn sscanf_common(
                 src_ptr -= 1;
                 env.mem.write(dst_ptr, b'\0');
             }
+            b's' => {
+                assert_eq!(max_width, 0);
+                assert!(length_modifier.is_none());
+                let mut dst_ptr: MutPtr<u8> = args.next(env);
+                loop {
+                    if !isspace(env, src_ptr.cast_const()) {
+                        env.mem.write(dst_ptr, env.mem.read(src_ptr));
+                        src_ptr += 1;
+                        dst_ptr += 1;
+                    } else {
+                        break;
+                    }
+                }
+                env.mem.write(dst_ptr, b'\0');
+            }
             // TODO: more specifiers
             _ => unimplemented!("Format character '{}'", specifier as char),
         }
@@ -608,6 +793,9 @@ fn sscanf_common(
 }
 
 fn sscanf(env: &mut Environment, src: ConstPtr<u8>, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "sscanf({:?} ({:?}), {:?} ({:?}), ...)",
         src,
@@ -619,7 +807,42 @@ fn sscanf(env: &mut Environment, src: ConstPtr<u8>, format: ConstPtr<u8>, args: 
     sscanf_common(env, src, format, args.start())
 }
 
+fn swscanf(
+    env: &mut Environment,
+    ws: ConstPtr<wchar_t>,
+    format: ConstPtr<wchar_t>,
+    args: DotDotDot,
+) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    // TODO: support other locales
+    let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
+    assert_eq!(env.mem.read(ctype_locale), b'C');
+
+    let w_string = env.mem.wcstr_at(ws);
+    let w_format = env.mem.wcstr_at(format);
+    log_dbg!(
+        "swscanf({:?} ({:?}), {:?} ({:?}), ...)",
+        ws,
+        w_string,
+        format,
+        w_format
+    );
+    // TODO: refactor code to parametrise sscanf_common()
+    // for normal and wide strings instead
+    let c_string = env.mem.alloc_and_write_cstr(w_string.as_bytes());
+    let c_format = env.mem.alloc_and_write_cstr(w_format.as_bytes());
+    let res = sscanf(env, c_string.cast_const(), c_format.cast_const(), args);
+    env.mem.free(c_string.cast());
+    env.mem.free(c_format.cast());
+    res
+}
+
 fn vsscanf(env: &mut Environment, src: ConstPtr<u8>, format: ConstPtr<u8>, arg: VaList) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
         "vsscanf({:?}, {:?} ({:?}), ...)",
         src,
@@ -636,32 +859,68 @@ fn fprintf(
     format: ConstPtr<u8>,
     args: DotDotDot,
 ) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    log_dbg!("fprintf() implemented as a wrapper of vfprintf()");
+
+    vfprintf(env, stream, format, args.start())
+}
+
+fn vfprintf(env: &mut Environment, stream: MutPtr<FILE>, format: ConstPtr<u8>, arg: VaList) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log_dbg!(
-        "fprintf({:?}, {:?} ({:?}), ...)",
+        "vfprintf({:?}, {:?} ({:?}), ...)",
         stream,
         format,
         env.mem.cstr_at_utf8(format)
     );
 
-    let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), args.start());
+    let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), arg);
     // TODO: I/O error handling
     match env.mem.read(stream).fd {
+        STDIN_FILENO => panic!("Unexpected file descriptor"),
         STDOUT_FILENO => _ = std::io::stdout().write_all(&res),
         STDERR_FILENO => _ = std::io::stderr().write_all(&res),
-        _ => unimplemented!(),
+        _ => {
+            let buf = env.mem.alloc_and_write_cstr(res.as_slice());
+            let result = fwrite(
+                env,
+                buf.cast_const().cast(),
+                1,
+                res.len() as GuestUSize,
+                stream,
+            );
+            assert_eq!(result, res.len() as GuestUSize);
+            env.mem.free(buf.cast());
+        }
     }
     res.len().try_into().unwrap()
 }
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sscanf(_, _, _)),
+    export_c_func!(swscanf(_, _, _)),
     export_c_func!(vsscanf(_, _, _)),
     export_c_func!(snprintf(_, _, _, _)),
     export_c_func!(vprintf(_, _)),
     export_c_func!(vsnprintf(_, _, _, _)),
     export_c_func!(vsprintf(_, _, _)),
+    export_c_func!(__sprintf_chk(_, _, _, _, _)),
     export_c_func!(sprintf(_, _, _)),
     export_c_func!(swprintf(_, _, _, _)),
+    export_c_func!(vswprintf(_, _, _, _)),
     export_c_func!(printf(_, _)),
     export_c_func!(fprintf(_, _, _)),
+    export_c_func!(vfprintf(_, _, _)),
 ];
+
+// Helper function, not a part of printf family
+// TODO: write proper libc's isspace()
+pub fn isspace(env: &mut Environment, src: ConstPtr<u8>) -> bool {
+    let c = env.mem.read(src);
+    // Rust's definition of whitespace excludes vertical tab, unlike C's
+    c.is_ascii_whitespace() || c == b'\x0b'
+}

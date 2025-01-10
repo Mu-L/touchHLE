@@ -6,9 +6,9 @@
 //! `UIApplication` and `UIApplicationMain`.
 
 use super::ui_device::*;
-use crate::dyld::{export_c_func, FunctionExports};
-use crate::frameworks::foundation::{ns_array, ns_string};
-use crate::frameworks::uikit::ui_nib::load_main_nib_file;
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
+use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str};
+use crate::frameworks::foundation::{ns_array, ns_string, NSInteger, NSUInteger};
 use crate::mem::MutPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -31,6 +31,7 @@ struct UIApplicationHostObject {
 impl HostObject for UIApplicationHostObject {}
 
 type UIInterfaceOrientation = UIDeviceOrientation;
+type UIRemoteNotificationType = NSUInteger;
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -48,7 +49,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)sharedApplication {
-    env.framework_state.uikit.ui_application.shared_application.unwrap()
+    env.framework_state.uikit.ui_application.shared_application.unwrap_or(nil)
 }
 
 // This should only be called by UIApplicationMain
@@ -72,7 +73,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     let old_delegate = std::mem::replace(&mut host_object.delegate, delegate);
     if host_object.delegate_is_retained {
         host_object.delegate_is_retained = false;
-        release(env, old_delegate);
+        if delegate != old_delegate {
+            release(env, old_delegate);
+        }
     }
 }
 
@@ -107,7 +110,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this setStatusBarOrientation:orientation]
 }
 
-- (bool)idleTimerDisabled {
+- (bool)isIdleTimerDisabled {
     !env.window().is_screen_saver_enabled()
 }
 - (())setIdleTimerDisabled:(bool)disabled {
@@ -142,6 +145,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     log!("TODO: ignoring endIgnoringInteractionEvents");
 }
 
+- (id)keyWindow {
+    // TODO: handle nil
+    let key_window = env
+        .framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .key_window
+        .unwrap();
+    assert!(env
+        .framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .visible_windows
+        .contains(&key_window));
+    key_window
+}
+
 - (id)windows {
     log!("TODO: UIApplication's windows getter is returning only visible windows");
     let visible_windows: Vec<id> = (*env
@@ -155,6 +177,31 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let windows = ns_array::from_vec(env, visible_windows);
     autorelease(env, windows)
+}
+
+- (())registerForRemoteNotificationTypes:(UIRemoteNotificationType)types {
+    log!("TODO: ignoring registerForRemoteNotificationTypes:{}", types);
+}
+
+- (())setApplicationIconBadgeNumber:(NSInteger)bn {
+    log!("TODO: ignoring setApplicationIconBadgeNumber:{}", bn);
+}
+
+// UIResponder implementation
+// From the Apple UIView docs regarding [UIResponder nextResponder]:
+// "The shared UIApplication object normally returns nil, but it returns its
+//  app delegate if that object is a subclass of UIResponder and hasn’t
+//  already been called to handle the event."
+- (id)nextResponder {
+    let delegate = msg![env; this delegate];
+    let app_delegate_class = msg![env; delegate class];
+    let ui_responder_class = env.objc.get_known_class("UIResponder", &mut env.mem);
+    if env.objc.class_is_subclass_of(app_delegate_class, ui_responder_class) {
+        // TODO: Send nil if it's already been called to handle the event
+        delegate
+    } else {
+        nil
+    }
 }
 
 @end
@@ -186,7 +233,26 @@ pub(super) fn UIApplicationMain(
         };
         let ui_application: id = msg![env; principal_class new];
 
-        load_main_nib_file(env, ui_application);
+        if let Some(main_nib_filename) = env.bundle.main_nib_filename() {
+            let ns_main_nib_filename = from_rust_string(env, main_nib_filename.to_string());
+            // We need to check first if main nib file exists,
+            // as `UINib nibWithNibName:bundle:` will crash on nonexistent
+            // nib otherwise
+            let type_: id = get_static_str(env, "nib");
+            let bundle: id = msg_class![env; NSBundle mainBundle];
+            let res: id = msg![env; bundle pathForResource:ns_main_nib_filename ofType:type_];
+            if res != nil {
+                let nib: id = msg_class![env; UINib nibWithNibName:ns_main_nib_filename bundle:nil];
+                release(env, ns_main_nib_filename);
+                let _: id = msg![env; nib instantiateWithOwner:ui_application
+                                               options:nil];
+            } else {
+                log!(
+                    "Warning: couldn't load main nib file {:?}",
+                    env.bundle.main_nib_filename()
+                );
+            }
+        }
 
         let delegate: id = msg![env; ui_application delegate];
         if delegate != nil {
@@ -302,5 +368,22 @@ pub(super) fn exit(env: &mut Environment) {
 
     std::process::exit(0);
 }
+
+pub const UIApplicationDidReceiveMemoryWarningNotification: &str =
+    "UIApplicationDidReceiveMemoryWarningNotification";
+pub const UIApplicationLaunchOptionsRemoteNotificationKey: &str =
+    "UIApplicationLaunchOptionsRemoteNotificationKey";
+
+/// `UIApplicationLaunchOptionsKey` values.
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UIApplicationDidReceiveMemoryWarningNotification",
+        HostConstant::NSString(UIApplicationDidReceiveMemoryWarningNotification),
+    ),
+    (
+        "_UIApplicationLaunchOptionsRemoteNotificationKey",
+        HostConstant::NSString(UIApplicationLaunchOptionsRemoteNotificationKey),
+    ),
+];
 
 pub const FUNCTIONS: FunctionExports = &[export_c_func!(UIApplicationMain(_, _, _, _))];

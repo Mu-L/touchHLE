@@ -61,8 +61,7 @@ use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAU
 
 use std::path::PathBuf;
 
-/// Current version. See `build.rs` for how this is generated.
-const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
+pub use touchHLE_version::*;
 
 /// This is the true entry point on Android (SDLActivity calls it after
 /// initialization). On other platforms the true entry point is in src/bin.rs.
@@ -80,7 +79,7 @@ pub extern "C" fn SDL_main(
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            &s
+            s
         } else {
             "(non-string payload)"
         };
@@ -96,7 +95,7 @@ pub extern "C" fn SDL_main(
         Ok(_) => echo!("touchHLE finished"),
         Err(e) => echo!("touchHLE errored: {e:?}"),
     }
-    return 0;
+    0
 }
 
 const USAGE: &str = "\
@@ -117,14 +116,27 @@ Special options:
 ";
 
 pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
-    echo!("touchHLE {} — https://touchhle.org/", VERSION);
+    echo!(
+        "touchHLE {}{}{} — https://touchhle.org/",
+        branding(),
+        if branding().is_empty() { "" } else { " " },
+        VERSION,
+    );
+    if GITHUB_RUN_ID.is_some() {
+        echo!(
+            "Built from branch {:?} of {:?} by GitHub Actions workflow run {}/{}/actions/runs/{}.",
+            GITHUB_REF_NAME.unwrap(),
+            GITHUB_REPOSITORY.unwrap(),
+            GITHUB_SERVER_URL.unwrap(),
+            GITHUB_REPOSITORY.unwrap(),
+            GITHUB_RUN_ID.unwrap()
+        );
+    }
     echo!();
 
     {
-        let base_path = paths::user_data_base_path().to_str().unwrap();
-        if !base_path.is_empty() {
-            log!("Base path for touchHLE files: {}", base_path);
-        }
+        let base_path = paths::user_data_base_path();
+        log!("Base path for touchHLE files: {}", base_path.display());
         paths::prepopulate_user_data_dir();
     }
 
@@ -175,7 +187,7 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         echo!(
             "No app specified, opening app picker. Use the --help flag to see command-line usage."
         );
-        let (bundle_path, env_for_salvage) = app_picker::app_picker(options)?;
+        let (bundle_path, env_for_salvage) = app_picker::app_picker(options, &mut option_args)?;
         (bundle_path, Some(env_for_salvage))
     };
 

@@ -5,10 +5,11 @@
  */
 //! `CALayer`.
 
-use crate::frameworks::core_foundation::{CFRelease, CFRetain};
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::cg_bitmap_context::{
     CGBitmapContextCreate, CGBitmapContextGetHeight, CGBitmapContextGetWidth,
 };
+use crate::frameworks::core_graphics::cg_color::{CGColorRef, CGColorRelease, CGColorRetain};
 use crate::frameworks::core_graphics::cg_color_space::CGColorSpaceCreateDeviceRGB;
 use crate::frameworks::core_graphics::cg_context::{
     CGContextClearRect, CGContextRef, CGContextRelease, CGContextTranslateCTM,
@@ -17,6 +18,7 @@ use crate::frameworks::core_graphics::cg_image::{
     kCGImageAlphaPremultipliedLast, kCGImageByteOrder32Big,
 };
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::foundation::ns_string;
 use crate::mem::{GuestUSize, Ptr};
 use crate::objc::{id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, ObjC};
 use std::collections::HashMap;
@@ -34,7 +36,7 @@ pub(super) struct CALayerHostObject {
     pub(super) hidden: bool,
     pub(super) opaque: bool,
     pub(super) opacity: f32,
-    pub(super) background_color: id,
+    pub(super) background_color: CGColorRef,
     pub(super) needs_display: bool,
     /// `CGImageRef*`
     pub(super) contents: id,
@@ -50,6 +52,22 @@ pub(super) struct CALayerHostObject {
     pub(super) gles_texture_is_up_to_date: bool,
 }
 impl HostObject for CALayerHostObject {}
+
+pub const kCAFilterLinear: &str = "kCAFilterLinear";
+pub const kCAFilterNearest: &str = "kCAFilterNearest";
+pub const kCAFilterTrilinear: &str = "kCAFilterTrilinear";
+
+pub const CONSTANTS: ConstantExports = &[
+    ("_kCAFilterLinear", HostConstant::NSString(kCAFilterLinear)),
+    (
+        "_kCAFilterNearest",
+        HostConstant::NSString(kCAFilterNearest),
+    ),
+    (
+        "_kCAFilterTrilinear",
+        HostConstant::NSString(kCAFilterTrilinear),
+    ),
+];
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -108,9 +126,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         release(env, contents);
     }
 
-    if background_color != nil {
-        CFRelease(env, background_color);
-    }
+    CGColorRelease(env, background_color);
 
     if let Some(cg_context) = cg_context {
         CGContextRelease(env, cg_context);
@@ -146,6 +162,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         env.objc.borrow_mut::<CALayerHostObject>(layer).superlayer = this;
         env.objc.borrow_mut::<CALayerHostObject>(this).sublayers.push(layer);
     }
+}
+
+- (())insertSublayer:(id)layer below:(id)sibling {
+    retain(env, layer);
+    () = msg![env; layer removeFromSuperlayer];
+    env.objc.borrow_mut::<CALayerHostObject>(layer).superlayer = this;
+
+    let CALayerHostObject { ref mut sublayers, .. } = env.objc.borrow_mut(this);
+    let idx = sublayers.iter().position(|&sublayer| sublayer == sibling).unwrap();
+    sublayers.insert(idx, layer);
 }
 
 - (())removeFromSuperlayer {
@@ -234,19 +260,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<CALayerHostObject>(this).opacity = opacity;
 }
 
-// See remarks in ui_view.rs about the type of this property
-- (id)backgroundColor {
+- (CGColorRef)backgroundColor {
     env.objc.borrow::<CALayerHostObject>(this).background_color
 }
-- (())setBackgroundColor:(id)new_color {
+- (())setBackgroundColor:(CGColorRef)new_color {
     let host_obj = env.objc.borrow_mut::<CALayerHostObject>(this);
     let old_color = std::mem::replace(&mut host_obj.background_color, new_color);
-    if new_color != nil {
-        CFRetain(env, new_color); // CFRetain doesn't like nil
-    }
-    if old_color != nil {
-        CFRelease(env, old_color); // CFRelease doesn't like nil
-    }
+    CGColorRetain(env, new_color);
+    CGColorRelease(env, old_color);
 }
 
 - (bool)needsDisplay {
@@ -371,6 +392,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     let old_contents = std::mem::replace(&mut host_obj.contents, new_contents);
     retain(env, new_contents);
     release(env, old_contents);
+}
+
+- (())setEdgeAntialiasingMask:(u32)mask {
+    log!("TODO: [(CALayer*){:?} setEdgeAntialiasingMask: {}]", this, mask); // TODO
+}
+
+- (())setMagnificationFilter:(id)filter {
+    log!("TODO: [(CALayer*){:?} setMagnificationFilter: {}]", this, ns_string::to_rust_string(env, filter)); // TODO
+}
+
+- (())setMinificationFilter:(id)filter {
+    log!("TODO: [(CALayer*){:?} setMinificationFilter: {}]", this, ns_string::to_rust_string(env, filter)); // TODO
 }
 
 - (bool)containsPoint:(CGPoint)point {

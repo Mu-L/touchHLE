@@ -8,15 +8,16 @@
 //! Resources:
 //! - Apple's [Threading Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/Introduction/Introduction.html)
 
-use super::{ns_string, ns_timer};
+use super::{ns_string, ns_timer, NSComparisonResult, NSOrderedAscending};
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::audio_toolbox::audio_queue::{handle_audio_queue, AudioQueueRef};
+use crate::frameworks::audio_toolbox::audio_unit::{render_audio_unit, AudioUnit};
 use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
 };
 use crate::frameworks::{core_animation, media_player, uikit};
 use crate::objc::{id, msg, objc_classes, release, retain, ClassExports, HostObject};
-use crate::Environment;
+use crate::{msg_class, Environment};
 use std::time::{Duration, Instant};
 
 /// `NSString*`
@@ -39,15 +40,20 @@ pub const CONSTANTS: ConstantExports = &[
 #[derive(Default)]
 pub struct State {
     main_thread_run_loop: Option<id>,
+    have_shown_reentrancy_warning: bool,
 }
 
 struct NSRunLoopHostObject {
+    audio_units: Vec<AudioUnit>,
     /// Weak reference. Audio queue must remove itself when destroyed (TODO).
     /// They are in no particular order.
     audio_queues: Vec<AudioQueueRef>,
     /// Strong references to `NSTimer*` in no particular order. Timers are owned
     /// by the run loop. The timer must remove itself when invalidated.
     timers: Vec<id>,
+    /// A bool flag to indicate if the run loop is running.
+    /// It is needed to deal with re-entrance issues.
+    is_running: bool,
 }
 impl HostObject for NSRunLoopHostObject {}
 
@@ -62,8 +68,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         rl
     } else {
         let host_object = Box::new(NSRunLoopHostObject {
+            audio_units: Vec::new(),
             audio_queues: Vec::new(),
             timers: Vec::new(),
+            is_running: false,
         });
         let new = env.objc.alloc_static_object(this, host_object, &mut env.mem);
         env.framework_state.foundation.ns_run_loop.main_thread_run_loop = Some(new);
@@ -112,11 +120,39 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())run {
     run_run_loop(env, this, /* single_iteration: */ false);
 }
+- (())runUntilDate:(id)date { // NSDate *
+    let now: id = msg_class![env; NSDate date];
+    let comp: NSComparisonResult = msg![env; date compare:now];
+    if comp == NSOrderedAscending {
+        // Limit date is in the past, run loop once and return
+        run_run_loop(env, this, /* single_iteration: */ true);
+        return;
+    }
+    todo!("Properly account the limit date")
+}
 // TODO: other run methods
 
 @end
 
 };
+
+/// For use by Audio Toolbox.
+pub fn add_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) {
+    env.objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_units
+        .push(unit);
+}
+
+/// For use by Audio Toolbox.
+pub fn remove_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) {
+    let units = &mut env
+        .objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_units;
+    let unit_idx = units.iter().position(|&item| item == unit).unwrap();
+    units.remove(unit_idx);
+}
 
 /// For use by Audio Toolbox.
 /// TODO: Maybe replace this with a `CFRunLoopObserver` or some other generic
@@ -173,10 +209,38 @@ fn run_run_loop(env: &mut Environment, run_loop: id, single_iteration: bool) {
         log_dbg!("Entering run loop {:?} (indefinitely)", run_loop);
     }
 
+    if env.objc.borrow::<NSRunLoopHostObject>(run_loop).is_running {
+        // TODO: The code right now can't handle re-entrancy properly; a timer
+        //       callback that re-enters the run loop will cause an infite loop.
+        //       This needs to be fixed. For now, we skip execution to avoid
+        //       triggering these bugs, but this means the app can't yield
+        //       control. :(
+        log_dbg!(
+            "Run loop {:?} is already running, skipping (TODO: support run loop re-entrancy)",
+            run_loop
+        );
+        if !std::mem::replace(
+            &mut env
+                .framework_state
+                .foundation
+                .ns_run_loop
+                .have_shown_reentrancy_warning,
+            true,
+        ) {
+            // Show one-time non-dbg warning to avoid spammy log output.
+            log!("Warning: run loop re-entrancy is unimplemented but may be relied upon by this app, this warning will only be shown once");
+        }
+        return;
+    };
+    env.objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .is_running = true;
+
     // Temporary vectors used to track things without needing a reference to the
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
     let mut audio_queues_tmp = Vec::new();
+    let mut audio_units_tmp = Vec::new();
 
     fn limit_sleep_time(current: &mut Option<Instant>, new: Option<Instant>) {
         if let Some(new) = new {
@@ -217,6 +281,14 @@ fn run_run_loop(env: &mut Environment, run_loop: id, single_iteration: bool) {
             handle_audio_queue(env, audio_queue);
         }
 
+        assert!(audio_units_tmp.is_empty());
+        audio_units_tmp
+            .extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).audio_units);
+
+        for audio_unit in audio_units_tmp.drain(..) {
+            render_audio_unit(env, audio_unit);
+        }
+
         media_player::handle_players(env);
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
@@ -243,4 +315,8 @@ fn run_run_loop(env: &mut Environment, run_loop: id, single_iteration: bool) {
             break;
         }
     }
+
+    env.objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .is_running = false;
 }

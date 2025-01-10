@@ -7,7 +7,10 @@
 
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::foundation::{ns_string, ns_url, NSInteger};
-use crate::objc::{id, msg, msg_class, objc_classes, release, retain, ClassExports};
+use crate::frameworks::uikit::ui_device::UIDeviceOrientation;
+use crate::objc::{
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
+};
 use crate::Environment;
 use std::collections::VecDeque;
 
@@ -36,6 +39,8 @@ pub const MPMoviePlayerPlaybackDidFinishNotification: &str =
 /// Apparently an undocumented, private API. Spore Origins uses it.
 pub const MPMoviePlayerContentPreloadDidFinishNotification: &str =
     "MPMoviePlayerContentPreloadDidFinishNotification";
+pub const MPMoviePlayerScalingModeDidChangeNotification: &str =
+    "MPMoviePlayerScalingModeDidChangeNotification";
 // TODO: More notifications?
 
 /// `NSNotificationName` values.
@@ -48,7 +53,17 @@ pub const CONSTANTS: ConstantExports = &[
         "_MPMoviePlayerContentPreloadDidFinishNotification",
         HostConstant::NSString(MPMoviePlayerContentPreloadDidFinishNotification),
     ),
+    (
+        "_MPMoviePlayerScalingModeDidChangeNotification",
+        HostConstant::NSString(MPMoviePlayerScalingModeDidChangeNotification),
+    ),
 ];
+
+struct MPMoviePlayerControllerHostObject {
+    // NSURL *
+    content_url: id,
+}
+impl HostObject for MPMoviePlayerControllerHostObject {}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -58,6 +73,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: actual playback
 
++ (id)allocWithZone:(NSZonePtr)_zone {
+    let host_object = Box::new(MPMoviePlayerControllerHostObject {
+        content_url: nil,
+    });
+    env.objc.alloc_object(this, host_object, &mut env.mem)
+}
+
 - (id)initWithContentURL:(id)url { // NSURL*
     log!(
         "TODO: [(MPMoviePlayerController*){:?} initWithContentURL:{:?} ({:?})]",
@@ -66,12 +88,26 @@ pub const CLASSES: ClassExports = objc_classes! {
         ns_url::to_rust_path(env, url),
     );
 
+    retain(env, url);
+    env.objc.borrow_mut::<MPMoviePlayerControllerHostObject>(this).content_url = url;
+
     // Act as if loading immediately completed (Spore Origins waits for this).
     State::get(env).pending_notifications.push_back(
         (MPMoviePlayerContentPreloadDidFinishNotification, this)
     );
 
     this
+}
+
+- (())dealloc {
+    let url = env.objc.borrow::<MPMoviePlayerControllerHostObject>(this).content_url;
+    release(env, url);
+
+    env.objc.dealloc_object(this, &mut env.mem);
+}
+
+- (id)contentURL {
+    env.objc.borrow::<MPMoviePlayerControllerHostObject>(this).content_url
 }
 
 - (())setBackgroundColor:(id)_color { // UIColor*
@@ -97,6 +133,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     // As this is undocumented and we don't have real video playback yet, let's
     // ignore it otherwise.
+}
+
+// Another undocumented one! But some apps may still use it :/
+// https://stackoverflow.com/a/1390079/2241008
+- (())setOrientation:(UIDeviceOrientation)_orientation animated:(bool)_animated {
+
 }
 
 // MPMediaPlayback implementation

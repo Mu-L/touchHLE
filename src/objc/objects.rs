@@ -233,7 +233,7 @@ impl super::ObjC {
     }
 
     /// Get a reference to a host object, if the object exists.
-    pub(super) fn get_host_object(&self, object: id) -> Option<&dyn AnyHostObject> {
+    pub fn get_host_object(&self, object: id) -> Option<&dyn AnyHostObject> {
         self.objects.get(&object).map(|entry| &*entry.host_object)
     }
 
@@ -273,6 +273,26 @@ impl super::ObjC {
                 panic!();
             }
         }
+    }
+
+    /// Getting a refcount of an object.
+    /// While Apple's docs advise to not relay on the returned value,
+    /// some games (like "Cut the Rope") does call `retainCount`.
+    pub fn get_refcount(&mut self, object: id) -> NonZeroU32 {
+        let Some(entry) = self.objects.get_mut(&object) else {
+            panic!(
+                "No entry found for object {:?}, it may have already been deallocated",
+                object
+            );
+        };
+        let Some(refcount) = entry.refcount.as_mut() else {
+            // Might mean a missing `retain` override.
+            panic!(
+                "Attempt to get refcount on static-lifetime object {:?}!",
+                object
+            );
+        };
+        *refcount
     }
 
     /// Increase the refcount of a reference-counted object. Do not call this

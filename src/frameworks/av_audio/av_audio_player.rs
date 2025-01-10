@@ -9,21 +9,24 @@
 
 use crate::dyld::HostFunction;
 use crate::frameworks::audio_toolbox::audio_file::{
-    kAudioFilePropertyDataFormat, kAudioFilePropertyPacketSizeUpperBound, kAudioFileReadPermission,
-    AudioFileClose, AudioFileGetProperty, AudioFileID, AudioFileOpenURL, AudioFileReadPackets,
+    self, kAudioFilePropertyDataFormat, kAudioFilePropertyPacketSizeUpperBound,
+    kAudioFileReadPermission, AudioFileClose, AudioFileGetProperty, AudioFileID, AudioFileOpenURL,
+    AudioFileReadPackets,
 };
 use crate::frameworks::audio_toolbox::audio_queue::{
     kAudioQueueParam_Volume, AudioQueueAllocateBuffer, AudioQueueBufferRef, AudioQueueDispose,
-    AudioQueueEnqueueBuffer, AudioQueueNewOutput, AudioQueueOutputCallback, AudioQueuePause,
-    AudioQueueRef, AudioQueueSetParameter, AudioQueueStart, AudioQueueStop,
+    AudioQueueEnqueueBuffer, AudioQueueGetParameter, AudioQueueNewOutput, AudioQueueOutputCallback,
+    AudioQueuePause, AudioQueueRef, AudioQueueSetParameter, AudioQueueStart, AudioQueueStop,
 };
 use crate::frameworks::carbon_core::eofErr;
 use crate::frameworks::core_audio_types::AudioStreamBasicDescription;
 use crate::frameworks::core_foundation::cf_run_loop::kCFRunLoopCommonModes;
-use crate::frameworks::foundation::ns_string;
+use crate::frameworks::foundation::ns_error::NSOSStatusErrorDomain;
+use crate::frameworks::foundation::{ns_string, NSInteger, NSTimeInterval};
 use crate::mem::{guest_size_of, GuestUSize, MutPtr, MutVoidPtr, Ptr};
-use crate::msg;
-use crate::objc::{id, nil, release, retain, Class, ClassExports, HostObject, NSZonePtr};
+use crate::objc::{
+    id, msg, msg_class, nil, release, retain, Class, ClassExports, HostObject, NSZonePtr,
+};
 use crate::objc_classes;
 use crate::Environment;
 
@@ -38,8 +41,12 @@ struct AVAudioPlayerHostObject {
     audio_queue_buffers: Option<MutPtr<AudioQueueBufferRef>>,
     num_packets_to_read: u32,
     current_packet: i64,
+    // The time set by calling setCurrentTime is stored here in case it's set
+    // before prepareToPlay is called; so it can be applied when it's called
+    set_current_time: NSTimeInterval,
     volume: f32,
     is_playing: bool,
+    num_of_loops: NSInteger,
 }
 impl HostObject for AVAudioPlayerHostObject {}
 
@@ -65,22 +72,39 @@ pub const CLASSES: ClassExports = objc_classes! {
         audio_queue_buffers: None,
         num_packets_to_read: 0,
         current_packet: 0,
+        set_current_time: 0.0,
         volume: 1.0,
-        is_playing: false
+        is_playing: false,
+        num_of_loops: 0
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
-- (id)initWithContentsOfURL:(id)url error:(id)error {
-    assert!(error.is_null());
+- (id)initWithContentsOfURL:(id)url // NSURL*
+                      error:(MutPtr<id>)outError { // NSError**
     let path: id = msg![env; url path];
     let path_str = ns_string::to_rust_string(env, path);
-    log_dbg!("initWithContentsOfURL: {}", path_str);
+    log_dbg!("[(AVAudioPlayer*){:?} initWithContentsOfURL:{:?} {} outError:{:?}]", this, url, path_str, outError);
 
     retain(env, url);
+    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_url = url;
 
-    let host_object = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
-    host_object.audio_file_url = url;
+    // Check for errors. Return nil and write them to error if there are
+    let tmp_afi_ptr: MutPtr<AudioFileID> = env.mem.alloc(guest_size_of::<AudioFileID>()).cast();
+    let status = AudioFileOpenURL(env, url, kAudioFileReadPermission, 0, tmp_afi_ptr) as NSInteger;
+    let audio_file_id = env.mem.read(tmp_afi_ptr);
+    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_id = Some(audio_file_id);
+    env.mem.free(tmp_afi_ptr.cast());
+    if status != 0 {
+        if !outError.is_null() {
+            let domain = ns_string::get_static_str(env, NSOSStatusErrorDomain);
+            let error = msg_class![env; NSError alloc];
+            let error = msg![env; error initWithDomain:domain code:status userInfo:nil];
+            env.mem.write(outError, error);
+        }
+        return nil;
+    }
+
     this
 }
 
@@ -88,6 +112,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     log!("TODO: [(AVAudioPlayer*){:?} setDelegate:{:?}]", this, delegate);
 }
 
+- (f32)volume {
+    let aq_ref = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_queue;
+    if aq_ref.is_none() {
+        // TODO: is it correct? can we always return it instead of querying?
+        return env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).volume;
+    }
+
+    let tmp: MutPtr<f32> = env.mem.alloc(guest_size_of::<f32>()).cast();
+    let status = AudioQueueGetParameter(env, aq_ref.unwrap(), kAudioQueueParam_Volume, tmp);
+    assert_eq!(status, 0);
+    let res = env.mem.read(tmp);
+    env.mem.free(tmp.cast());
+    res
+}
 - (())setVolume:(f32)volume {
     let host_object = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
     host_object.volume = volume;
@@ -98,20 +136,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())prepareToPlay {
-    let audio_file_id = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_id;
-    if audio_file_id.is_some() {
+    let audio_queue = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_queue;
+    if audio_queue.is_some() {
         return;
     }
 
-    let audio_file_url = env.objc.borrow::<AVAudioPlayerHostObject>(this).audio_file_url;
+    let audio_file_id = env.objc.borrow::<AVAudioPlayerHostObject>(this).audio_file_id.unwrap();
     let callback = env.objc.borrow::<AVAudioPlayerHostObject>(this).output_callback;
-
-    let tmp_afi_ptr: MutPtr<AudioFileID> = env.mem.alloc(guest_size_of::<AudioFileID>()).cast();
-    let status = AudioFileOpenURL(env, audio_file_url, kAudioFileReadPermission, 0, tmp_afi_ptr);
-    assert_eq!(status, 0);
-    let audio_file_id = env.mem.read(tmp_afi_ptr);
-    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_id = Some(audio_file_id);
-    env.mem.free(tmp_afi_ptr.cast());
 
     let size = guest_size_of::<AudioStreamBasicDescription>();
     let tmp_size_ptr: MutPtr<GuestUSize> = env.mem.alloc(guest_size_of::<GuestUSize>()).cast();
@@ -135,6 +166,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert_eq!(status, 0);
     let aq_ref = env.mem.read(aq_ref_ptr);
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_queue = Some(aq_ref);
+
+    // Reapply the previously set current time and volume in case
+    // setVolume/setCurrentTime were called before prepareToPlay
+    let volume = env.objc.borrow::<AVAudioPlayerHostObject>(this).volume;
+    () = msg![env; this setVolume:volume];
+    let set_current_time = env.objc.borrow::<AVAudioPlayerHostObject>(this).set_current_time;
+    () = msg![env; this setCurrentTime:set_current_time];
 
     let size = guest_size_of::<u32>();
     env.mem.write(tmp_size_ptr, size);
@@ -164,10 +202,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.mem.free(tmp_size_ptr.cast());
     env.mem.free(aq_ref_ptr.cast());
     env.mem.free(tmp_data_ptr.cast());
-
-    // Reapply volume in case setVolume was called before prepareToPlay
-    let volume = env.objc.borrow::<AVAudioPlayerHostObject>(this).volume;
-    () = msg![env; this setVolume:volume];
 }
 
 - (bool)isPlaying {
@@ -190,13 +224,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())pause {
     env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).is_playing = false;
     if let Some(aq_ref) = env.objc.borrow::<AVAudioPlayerHostObject>(this).audio_queue {
-         AudioQueuePause(env, aq_ref);
+        AudioQueuePause(env, aq_ref);
     }
 }
 
 - (())stop {
     let &mut AVAudioPlayerHostObject {
-        audio_file_id,
         audio_queue,
         audio_queue_buffers,
         ..
@@ -206,29 +239,66 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     AudioQueueDispose(env, audio_queue.unwrap(), true);
-    AudioFileClose(env, audio_file_id.unwrap());
     env.mem.free(audio_queue_buffers.unwrap().cast());
 
-    let &AVAudioPlayerHostObject { audio_file_url, output_callback, .. } = env.objc.borrow(this);
+    let &AVAudioPlayerHostObject { audio_file_url, output_callback, num_of_loops, audio_file_id, .. } = env.objc.borrow(this);
     *env.objc.borrow_mut::<AVAudioPlayerHostObject>(this) = AVAudioPlayerHostObject {
         audio_file_url,
         output_callback,
-        audio_file_id: None,
+        num_of_loops,
+        audio_file_id,
         audio_desc: None,
         audio_queue: None,
         audio_queue_buffers: None,
         num_packets_to_read: 0,
         current_packet: 0,
+        set_current_time: 0.0,
         volume: 1.0,
         is_playing: false
     };
 }
 
+- (())setNumberOfLoops:(NSInteger)numberOfLoops {
+    log_dbg!("[(AVAudioPlayer *) {:?} setNumberOfLoops:{:?}]", this, numberOfLoops);
+    env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).num_of_loops = numberOfLoops;
+}
+
 - (())dealloc {
     () = msg![env; this stop];
-    let url = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this).audio_file_url;
-    release(env, url);
+    let &AVAudioPlayerHostObject {audio_file_url, audio_file_id, ..} = env.objc.borrow(this);
+    release(env, audio_file_url);
+    if let Some(audio_file_id) = audio_file_id {
+        AudioFileClose(env, audio_file_id);
+    }
     env.objc.dealloc_object(this, &mut env.mem)
+}
+
+- (NSTimeInterval)currentTime {
+    let host_object = env.objc.borrow::<AVAudioPlayerHostObject>(this);
+    let current_time = if let Some(audio_desc) = host_object.audio_desc {
+        let current_frame = (host_object.current_packet as f64) * (audio_desc.frames_per_packet as f64);
+        current_frame / audio_desc.sample_rate
+    } else {
+        0.0
+    };
+    log_dbg!("[(AVAudioPlayer *) {:?} currentTime] -> {:?}", this, current_time);
+    current_time
+}
+- (())setCurrentTime:(NSTimeInterval)currentTime {
+    // TODO: Support setting current time before having an audio description
+    let host_object = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
+    host_object.set_current_time = currentTime;
+    if let (Some(audio_desc), Some(audio_file_id)) = (host_object.audio_desc, host_object.audio_file_id) {
+        let total_packets = audio_file::State::get(&mut env.framework_state).audio_files.get(&audio_file_id).unwrap().audio_file.packet_count();
+        let total_frames = total_packets * audio_desc.frames_per_packet as u64;
+        let new_current_frame = audio_desc.sample_rate * currentTime;
+        if new_current_frame < 0.0 || new_current_frame > total_frames as f64 {
+            host_object.current_packet = 0;
+        } else {
+            host_object.current_packet = (new_current_frame / (audio_desc.frames_per_packet as f64)) as i64;
+        }
+    }
+    log_dbg!("[(AVAudioPlayer *) {:?} setCurrentTime: {}]", this, currentTime);
 }
 
 @end
@@ -316,15 +386,14 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
         num_packets_ptr,
         audio_queue_buffer.audio_data,
     );
-    if status == eofErr {
-        // TODO: respect number of loops
-        return;
-    } else {
-        assert_eq!(status, 0);
-    }
     let num_packets = env.mem.read(num_packets_ptr);
+    let num_bytes = env.mem.read(num_bytes_ptr);
+    env.mem.free(num_packets_ptr.cast());
+    env.mem.free(num_bytes_ptr.cast());
+
     if num_packets > 0 {
-        audio_queue_buffer.audio_data_byte_size = env.mem.read(num_bytes_ptr);
+        assert!(status == 0 || status == eofErr);
+        audio_queue_buffer.audio_data_byte_size = num_bytes;
         env.mem.write(in_buf, audio_queue_buffer);
         let status = AudioQueueEnqueueBuffer(env, aq, in_buf, 0, Ptr::null());
         assert_eq!(status, 0);
@@ -332,13 +401,27 @@ fn _touchHLE_AVAudioPlayerOutputBufferHelper(
             .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
             .current_packet = current_packet + num_packets as i64;
     } else {
-        let status = AudioQueueStop(env, aq, false);
-        assert_eq!(status, 0);
-        env.objc
-            .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
-            .is_playing = false;
+        assert_eq!(status, eofErr);
+        let number_of_loops = env
+            .objc
+            .borrow::<AVAudioPlayerHostObject>(av_audio_player)
+            .num_of_loops;
+        if number_of_loops == 0 {
+            let status = AudioQueueStop(env, aq, false);
+            assert_eq!(status, 0);
+            env.objc
+                .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
+                .is_playing = false;
+        } else {
+            if number_of_loops > 0 {
+                env.objc
+                    .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
+                    .num_of_loops -= 1;
+            }
+            env.objc
+                .borrow_mut::<AVAudioPlayerHostObject>(av_audio_player)
+                .current_packet = 0;
+            _touchHLE_AVAudioPlayerOutputBufferHelper(env, in_user_data, in_aq, in_buf);
+        }
     }
-
-    env.mem.free(num_packets_ptr.cast());
-    env.mem.free(num_bytes_ptr.cast());
 }
