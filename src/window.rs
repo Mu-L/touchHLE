@@ -78,6 +78,13 @@ pub enum FingerId {
 pub type Coords = (f32, f32);
 
 #[derive(Debug)]
+pub enum TextInputEvent {
+    Text(String),
+    Backspace,
+    Return,
+}
+
+#[derive(Debug)]
 pub enum Event {
     /// User requested quit.
     Quit,
@@ -93,6 +100,7 @@ pub enum Event {
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
+    TextInput(TextInputEvent),
 }
 
 pub enum GLVersion {
@@ -154,12 +162,13 @@ pub struct Window {
     accelerometer: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+    virtual_accelerometer_last: Option<(f32, f32, bool)>,
 }
 impl Window {
     /// Returns [true] if touchHLE is running on a device where we should always
     /// display fullscreen, but SDL2 will let us control the orientation, i.e.
     /// Android devices.
-    fn rotatable_fullscreen() -> bool {
+    pub fn rotatable_fullscreen() -> bool {
         env::consts::OS == "android"
     }
 
@@ -293,6 +302,7 @@ impl Window {
             accelerometer,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
+            virtual_accelerometer_last: None,
         };
 
         // Set up OpenGL ES context used for splash screen and app UI rendering
@@ -350,6 +360,12 @@ impl Window {
             let out_y = (y + 0.5) * out_h as f32;
             (out_x, out_y)
         }
+        fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
+            let (_, _, vw, vh) = window.viewport();
+            let out_x = ((in_x as f32 / vw as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let out_y = ((in_y as f32 / vh as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            (out_x, out_y)
+        }
         fn translate_button(button: sdl2::controller::Button) -> Option<crate::options::Button> {
             match button {
                 sdl2::controller::Button::DPadLeft => Some(crate::options::Button::DPadLeft),
@@ -394,6 +410,38 @@ impl Window {
             } else {
                 break;
             };
+
+            // Virtual accelerometer
+            match event {
+                E::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } => {
+                    let (x, y) = transform_virt_accel_coords(self, (x, y));
+                    self.virtual_accelerometer_last = Some((x, y, true));
+                }
+                E::MouseMotion {
+                    x, y, mousestate, ..
+                } => {
+                    if mousestate.right() {
+                        let (x, y) = transform_virt_accel_coords(self, (x, y));
+                        self.virtual_accelerometer_last = Some((x, y, true));
+                    }
+                }
+                E::MouseButtonUp {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } => {
+                    let (x, y) = transform_virt_accel_coords(self, (x, y));
+                    self.virtual_accelerometer_last = Some((x, y, false));
+                }
+                _ => {}
+            }
+
             self.event_queue.push_back(match event {
                 E::Quit { .. } => Event::Quit,
                 E::MouseButtonDown {
@@ -575,6 +623,24 @@ impl Window {
                     echo!("F12 pressed, EnterDebugger event queued.");
                     Event::EnterDebugger
                 }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::Backspace),
+                    ..
+                } => {
+                    log_dbg!("SDL TextInput Backspace");
+                    Event::TextInput(TextInputEvent::Backspace)
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::Return),
+                    ..
+                } => {
+                    log_dbg!("SDL TextInput Return");
+                    Event::TextInput(TextInputEvent::Return)
+                }
+                E::TextInput { text, .. } => {
+                    log_dbg!("SDL TextInput {}", text);
+                    Event::TextInput(TextInputEvent::Text(text))
+                }
                 _ => continue,
             })
         }
@@ -614,9 +680,15 @@ impl Window {
             log!("Warning: A new controller was connected, but it couldn't be accessed!");
             return;
         };
+
+        let controller_name = controller.name();
+        if env::consts::OS == "android" && controller_name.starts_with("uinput-") {
+            log!("ignoring fingerprint device: {}", controller_name);
+            return;
+        }
         log!(
             "New controller connected: {}. Left stick = device tilt. Right stick = touch input (press the stick or shoulder button to tap/hold).",
-            controller.name()
+            controller_name
         );
         self.controllers.push(controller);
     }
@@ -644,6 +716,7 @@ impl Window {
         } else if self.controllers.is_empty() {
             log!("Connect a controller to get accelerometer simulation.");
         }
+        log!("You can also hold right click and move the cursor to simulate the accelerometer.");
     }
 
     /// Get the real or simulated accelerometer output.
@@ -667,8 +740,18 @@ impl Window {
             }
         }
 
-        // Get left analog stick input. The range is [-1, 1] on each axis.
-        let (x, y, _) = self.get_controller_stick(options, true);
+        let (x, y) = if self
+            .virtual_accelerometer_last
+            .is_some_and(|(_x, _y, right_click_hold)| right_click_hold)
+        {
+            self.virtual_accelerometer_last
+                .map(|(x, y, _right_click_hold)| (x, y))
+                .unwrap()
+        } else {
+            // Get left analog stick input. The range is [-1, 1] on each axis.
+            let (x, y, _) = self.get_controller_stick(options, true);
+            (x, y)
+        };
 
         // Correct for window rotation
         let [x, y] = self.rotation_matrix().transform([x, y]);
@@ -875,6 +958,12 @@ impl Window {
         // For some reason, rust-sdl2 uses *const (), but () is not meant to be
         // used for void pointees (just void results), so let's fix that.
         self.video_ctx.gl_get_proc_address(procname) as *const _
+    }
+
+    pub fn set_share_with_current_context(&self, value: bool) {
+        self.video_ctx
+            .gl_attr()
+            .set_share_with_current_context(value)
     }
 
     pub unsafe fn make_gl_context_current(&self, gl_ctx: &GLContext) {

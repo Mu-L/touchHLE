@@ -16,13 +16,15 @@ use crate::frameworks::core_graphics::cg_image::{self, kCGImageAlphaPremultiplie
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
 use crate::frameworks::foundation::ns_string;
-use crate::frameworks::uikit::ui_font::{UITextAlignmentCenter, UITextAlignmentRight};
+use crate::frameworks::uikit::ui_font::{
+    UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
+};
 use crate::frameworks::uikit::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
 use crate::frameworks::uikit::ui_view::ui_control::ui_button::{
     UIButtonTypeCustom, UIButtonTypeRoundedRect,
 };
 use crate::frameworks::uikit::ui_view::ui_control::{
-    UIControlEventTouchUpInside, UIControlStateNormal,
+    UIControlEventTouchUpInside, UIControlEventValueChanged, UIControlStateNormal,
 };
 use crate::fs::BundleData;
 use crate::image::Image;
@@ -30,9 +32,11 @@ use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
 use crate::options::Options;
 use crate::paths;
+use crate::window::DeviceOrientation;
 use crate::Environment;
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 struct AppInfo {
@@ -45,7 +49,10 @@ struct AppInfo {
     icon_ui_image: Option<id>,
 }
 
-pub fn app_picker(options: Options) -> Result<(PathBuf, Environment), String> {
+pub fn app_picker(
+    options: Options,
+    option_args: &mut Vec<String>,
+) -> Result<(PathBuf, Environment), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
@@ -71,7 +78,7 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Environment), String> {
             })
     };
 
-    show_app_picker_gui(options, apps)
+    show_app_picker_gui(options, option_args, apps)
 }
 
 fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
@@ -118,6 +125,9 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
             icon_ui_image: None,
         });
     }
+
+    apps.sort_by_key(|app| app.display_name.to_uppercase());
+
     Ok(apps)
 }
 
@@ -128,6 +138,17 @@ struct AppPickerDelegateHostObject {
     copyright_hide: bool,
     copyright_prev: bool,
     copyright_next: bool,
+    quick_options_show: bool,
+    quick_options_hide: bool,
+    scale_hack_default: bool,
+    scale_hack1: bool,
+    scale_hack2: bool,
+    scale_hack3: bool,
+    scale_hack4: bool,
+    orientation_default: bool,
+    orientation_landscape_left: bool,
+    orientation_landscape_right: bool,
+    fullscreen: Option<bool>,
 }
 impl HostObject for AppPickerDelegateHostObject {}
 
@@ -138,7 +159,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
 
-@implementation _touchHLE_AppPickerDelegate
+@implementation _touchHLE_AppPickerDelegate: NSObject
 
 - (())iconTapped:(id)sender {
     // There is no allocWithZone: that creates AppPickerDelegateHostObject, so
@@ -159,6 +180,44 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())copyrightInfoNextPage {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).copyright_next = true;
+}
+
+- (())quickOptionsShow {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_options_show = true;
+}
+- (())quickOptionsHide {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_options_hide = true;
+}
+- (())scaleHackDefault {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_default = true;
+}
+- (())scaleHack1 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack1 = true;
+}
+- (())scaleHack2 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack2 = true;
+}
+- (())scaleHack3 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack3 = true;
+}
+- (())scaleHack4 {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack4 = true;
+}
+- (())orientationDefault {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_default = true;
+}
+- (())orientationDefault {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_default = true;
+}
+- (())orientationLandscapeLeft {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_landscape_left = true;
+}
+- (())orientationLandscapeRight {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_landscape_right = true;
+}
+- (())fullscreen:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).fullscreen = Some(switch_state);
 }
 
 - (())openFileManager {
@@ -196,9 +255,28 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 fn show_app_picker_gui(
     options: Options,
+    option_args: &mut Vec<String>,
     mut apps: Result<Vec<AppInfo>, String>,
 ) -> Result<(PathBuf, Environment), String> {
-    let mut environment = Environment::new_without_app(options)?;
+    let icon = {
+        let bytes: &[u8] = match super::branding() {
+            "" => include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon.png")),
+            "UNOFFICIAL" => include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/res/icon-unofficial.png"
+            )),
+            "PREVIEW" => {
+                include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/res/icon-preview.png"))
+            }
+            _ => panic!(),
+        };
+        let mut image = Image::from_bytes(bytes).unwrap();
+        // should match Bundle::load_icon()
+        image.round_corners((10.0 / 57.0) * (image.dimensions().0 as f32));
+        image
+    };
+
+    let mut environment = Environment::new_without_app(options, icon)?;
     let env = &mut environment;
 
     // Note that objects are generally not released in this code, because they
@@ -227,6 +305,57 @@ fn show_app_picker_gui(
     let main_view: id = msg![env; main_view initWithFrame:app_frame];
     () = msg![env; window addSubview:main_view];
 
+    // Wallpaper
+    let mut found_wallpaper = false;
+    let mut have_wallpaper = false;
+    for candidate in paths::WALLPAPER_FILES {
+        let candidate = paths::user_data_base_path().join(candidate);
+        if !candidate.exists() {
+            continue;
+        }
+        found_wallpaper = true;
+
+        let image = match std::fs::read(&candidate) {
+            Ok(image) => image,
+            Err(e) => {
+                log!("Warning: couldn't read {}: {}", candidate.display(), e);
+                break;
+            }
+        };
+        let image = match Image::from_bytes(&image) {
+            Ok(image) => image,
+            Err(e) => {
+                log!("Warning: couldn't decode {}: {}", candidate.display(), e);
+                break;
+            }
+        };
+
+        let image = cg_image::from_image(env, image);
+        let image: id = msg_class![env; UIImage imageWithCGImage:image];
+        let wallpaper: id = msg_class![env; UIImageView alloc];
+        let wallpaper: id = msg![env; wallpaper initWithImage:image];
+        () = msg![env; wallpaper setFrame:(CGRect {
+            origin: CGPoint {
+                x: 0.0,
+                y: 0.0,
+            },
+            size: app_frame.size,
+        })];
+        () = msg![env; wallpaper setAlpha:(0.5 as CGFloat)];
+        () = msg![env; main_view addSubview:wallpaper];
+        have_wallpaper = true;
+        break;
+    }
+    if !found_wallpaper {
+        let CGSize { width, height } = app_frame.size;
+        log!(
+            "No wallpaper found; filename can be one of: {}; ideal size is {}×{} pixels",
+            paths::WALLPAPER_FILES.join(", "),
+            width,
+            height,
+        );
+    }
+
     // Version label
     {
         let label_frame = CGRect {
@@ -241,14 +370,61 @@ fn show_app_picker_gui(
         };
         let label: id = msg_class![env; UILabel alloc];
         let label: id = msg![env; label initWithFrame:label_frame];
-        let text = ns_string::from_rust_string(env, format!("touchHLE {}", crate::VERSION));
+        let text = ns_string::from_rust_string(
+            env,
+            format!(
+                "touchHLE {}{}{}",
+                super::branding(),
+                if super::branding().is_empty() {
+                    ""
+                } else {
+                    " "
+                },
+                crate::VERSION
+            ),
+        );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
         let font_size: CGFloat = 12.0;
         let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
         () = msg![env; label setFont:font];
-        let text_color: id = msg_class![env; UIColor lightGrayColor];
+        let text_color: id = if have_wallpaper {
+            msg_class![env; UIColor whiteColor]
+        } else {
+            msg_class![env; UIColor lightGrayColor]
+        };
         () = msg![env; label setTextColor:text_color];
+        let bg_color: id = msg_class![env; UIColor clearColor];
+        () = msg![env; label setBackgroundColor:bg_color];
+        () = msg![env; main_view addSubview:label];
+    }
+
+    let brand_color: id = if super::branding() == "UNOFFICIAL" {
+        msg_class![env; UIColor redColor]
+    } else {
+        msg_class![env; UIColor grayColor]
+    };
+
+    for i in 1..=7 {
+        let label_frame = CGRect {
+            origin: CGPoint {
+                x: 0.0,
+                y: (app_frame.size.height / 8.0) * (i as f32) - 25.0,
+            },
+            size: CGSize {
+                width: app_frame.size.width,
+                height: 50.0,
+            },
+        };
+        let label: id = msg_class![env; UILabel alloc];
+        let label: id = msg![env; label initWithFrame:label_frame];
+        let text = ns_string::from_rust_string(env, super::branding().to_owned());
+        () = msg![env; label setText:text];
+        () = msg![env; label setTextAlignment:(if i % 2 == 0 { UITextAlignmentLeft } else { UITextAlignmentRight })];
+        let font_size: CGFloat = 48.0;
+        let font: id = msg_class![env; UIFont systemFontOfSize:font_size];
+        () = msg![env; label setFont:font];
+        () = msg![env; label setTextColor:brand_color];
         let bg_color: id = msg_class![env; UIColor clearColor];
         () = msg![env; label setBackgroundColor:bg_color];
         () = msg![env; main_view addSubview:label];
@@ -258,8 +434,14 @@ fn show_app_picker_gui(
 
     let mut icon_grid_stuff = match &mut apps {
         Ok(ref mut apps) => {
-            let mut icon_grid_stuff =
-                make_icon_grid(env, delegate, main_view, app_frame, apps.len());
+            let mut icon_grid_stuff = make_icon_grid(
+                env,
+                delegate,
+                main_view,
+                app_frame,
+                apps.len(),
+                have_wallpaper,
+            );
             update_icon_grid(env, &mut icon_grid_stuff, apps, 0);
             Some(icon_grid_stuff)
         }
@@ -294,7 +476,10 @@ fn show_app_picker_gui(
         main_view,
         app_frame.size,
         buttons_row_center,
-        &[("Open file manager", "openFileManager")],
+        &[
+            ("File manager", "openFileManager"),
+            ("Quick options", "quickOptionsShow"),
+        ],
         None,
     );
     make_button_row(
@@ -314,10 +499,54 @@ fn show_app_picker_gui(
     let mut copyright_info_stuff = setup_copyright_info(env, delegate, main_view, app_frame);
     let mut copyright_info_page_idx = 0;
 
+    let quick_options_stuff = setup_quick_options(env, delegate, main_view, app_frame);
+    let mut quick_options_scale_hack: Option<NonZeroU32> = None;
+    let mut quick_options_fullscreen: Option<()> = None;
+    let mut quick_options_orientation: Option<DeviceOrientation> = None;
+
+    fn update_quick_option_buttons(env: &mut Environment, buttons: &[id], selected_idx: usize) {
+        for (idx, &button) in buttons.iter().enumerate() {
+            let color: id = if idx == selected_idx {
+                msg_class![env; UIColor magentaColor]
+            } else {
+                msg_class![env; UIColor grayColor]
+            };
+            () = msg![env; button setBackgroundColor:color];
+        }
+    }
+    fn update_scale_hack_buttons(env: &mut Environment, buttons: &[id], value: Option<NonZeroU32>) {
+        update_quick_option_buttons(env, buttons, value.map_or(0, |v| (v.get() as usize)));
+    }
+    fn update_orientation_buttons(
+        env: &mut Environment,
+        buttons: &[id],
+        value: Option<DeviceOrientation>,
+    ) {
+        update_quick_option_buttons(
+            env,
+            buttons,
+            value.map_or(0, |v| match v {
+                DeviceOrientation::LandscapeLeft => 1,
+                DeviceOrientation::LandscapeRight => 2,
+                _ => panic!(),
+            }),
+        );
+    }
+    update_scale_hack_buttons(
+        env,
+        &quick_options_stuff.scale_hack_buttons,
+        quick_options_scale_hack,
+    );
+    update_orientation_buttons(
+        env,
+        &quick_options_stuff.orientation_buttons,
+        quick_options_orientation,
+    );
+
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
-    loop {
+    let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
         let icon_tapped = std::mem::take(&mut host_obj.icon_tapped);
@@ -326,9 +555,7 @@ fn show_app_picker_gui(
                 Some(&TappedIcon::App(app_idx)) => {
                     let app_path = &apps.as_ref().unwrap()[app_idx].path;
                     echo!("Picked: {}", app_path.display());
-                    // Return the environment so some parts of it can be
-                    // salvaged.
-                    return Ok((app_path.clone(), environment));
+                    break app_path.clone();
                 }
                 Some(&TappedIcon::ChangePage(page_idx)) => {
                     update_icon_grid(
@@ -371,8 +598,94 @@ fn show_app_picker_gui(
                 &copyright_info_text,
                 copyright_info_page_idx,
             );
+        } else if std::mem::take(&mut host_obj.quick_options_show) {
+            () = msg![env; (quick_options_stuff.main_view) setHidden:false];
+        } else if std::mem::take(&mut host_obj.quick_options_hide) {
+            () = msg![env; (quick_options_stuff.main_view) setHidden:true];
+        } else if std::mem::take(&mut host_obj.scale_hack_default) {
+            quick_options_scale_hack = None;
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.scale_hack1) {
+            quick_options_scale_hack = Some(NonZeroU32::new(1).unwrap());
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.scale_hack2) {
+            quick_options_scale_hack = Some(NonZeroU32::new(2).unwrap());
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.scale_hack3) {
+            quick_options_scale_hack = Some(NonZeroU32::new(3).unwrap());
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.scale_hack4) {
+            quick_options_scale_hack = Some(NonZeroU32::new(4).unwrap());
+            update_scale_hack_buttons(
+                env,
+                &quick_options_stuff.scale_hack_buttons,
+                quick_options_scale_hack,
+            );
+        } else if std::mem::take(&mut host_obj.orientation_default) {
+            quick_options_orientation = None;
+            update_orientation_buttons(
+                env,
+                &quick_options_stuff.orientation_buttons,
+                quick_options_orientation,
+            );
+        } else if std::mem::take(&mut host_obj.orientation_landscape_left) {
+            quick_options_orientation = Some(DeviceOrientation::LandscapeLeft);
+            update_orientation_buttons(
+                env,
+                &quick_options_stuff.orientation_buttons,
+                quick_options_orientation,
+            );
+        } else if std::mem::take(&mut host_obj.orientation_landscape_right) {
+            quick_options_orientation = Some(DeviceOrientation::LandscapeRight);
+            update_orientation_buttons(
+                env,
+                &quick_options_stuff.orientation_buttons,
+                quick_options_orientation,
+            );
+        } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
+            quick_options_fullscreen = match fullscreen {
+                false => None,
+                true => Some(()),
+            };
         }
+    };
+
+    // Apply user-specified overrides
+    if let Some(scale_hack) = quick_options_scale_hack {
+        option_args.push(format!("--scale-hack={}", scale_hack.get()));
     }
+    if let Some(orientation) = quick_options_orientation {
+        option_args.push(
+            match orientation {
+                DeviceOrientation::LandscapeLeft => "--landscape-left",
+                DeviceOrientation::LandscapeRight => "--landscape-right",
+                _ => todo!(),
+            }
+            .to_string(),
+        );
+    }
+    if let Some(()) = quick_options_fullscreen {
+        option_args.push("--fullscreen".to_string());
+    }
+
+    // Return the environment so some parts of it can be salvaged.
+    Ok((app_path, environment))
 }
 
 const ICON_SIZE: CGSize = CGSize {
@@ -400,6 +713,7 @@ fn make_icon_grid(
     main_view: id,
     app_frame: CGRect,
     total_app_count: usize,
+    have_wallpaper: bool,
 ) -> IconGridStuff {
     let num_cols = 4;
     let num_cols_f = num_cols as CGFloat;
@@ -452,9 +766,17 @@ fn make_icon_grid(
         let label: id = msg![env; label initWithFrame:label_frame];
         () = msg![env; label setTextAlignment:UITextAlignmentCenter];
         let font_size: CGFloat = label_size.height - 2.0;
-        let font: id = msg_class![env; UIFont boldSystemFontOfSize:font_size];
+        let font: id = if have_wallpaper {
+            msg_class![env; UIFont systemFontOfSize:font_size]
+        } else {
+            msg_class![env; UIFont boldSystemFontOfSize:font_size]
+        };
         () = msg![env; label setFont:font];
-        let text_color: id = msg_class![env; UIColor lightGrayColor];
+        let text_color: id = if have_wallpaper {
+            msg_class![env; UIColor whiteColor]
+        } else {
+            msg_class![env; UIColor lightGrayColor]
+        };
         () = msg![env; label setTextColor:text_color];
         let bg_color: id = msg_class![env; UIColor clearColor];
         () = msg![env; label setBackgroundColor:bg_color];
@@ -867,4 +1189,162 @@ fn change_copyright_page(
 
     () = msg![env; prev_page_button setHidden:(page_idx == 0)];
     () = msg![env; next_page_button setHidden:(Some(page_idx) == *last_page_idx)];
+}
+
+struct QuickOptionsStuff {
+    main_view: id,
+    scale_hack_buttons: [id; 5],
+    orientation_buttons: [id; 3],
+}
+
+fn setup_quick_options(
+    env: &mut Environment,
+    delegate: id,
+    super_view: id,
+    app_frame: CGRect,
+) -> QuickOptionsStuff {
+    // UIView*
+    let main_frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: app_frame.size,
+    };
+
+    // Container for all the other stuff
+
+    let main_view: id = msg_class![env; UIView alloc];
+    let main_view: id = msg![env; main_view initWithFrame:main_frame];
+    // TODO: Isn't white the default?
+    let bg_color: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; main_view setBackgroundColor:bg_color];
+    // This main_view is hidden until the copyright info button is tapped.
+    () = msg![env; main_view setHidden:true];
+    () = msg![env; super_view addSubview:main_view];
+
+    let divider = 40.0;
+
+    // Close button
+    {
+        let button_frame = CGRect {
+            origin: CGPoint {
+                x: main_frame.size.width - 30.0,
+                y: 10.0,
+            },
+            size: CGSize {
+                width: 20.0,
+                height: 20.0,
+            },
+        };
+
+        let button: id = msg_class![env; UIButton buttonWithType:UIButtonTypeRoundedRect];
+        let text = ns_string::get_static_str(env, "×");
+        () = msg![env; button setTitle:text forState:UIControlStateNormal];
+        () = msg![env; button setFrame:button_frame];
+        // FIXME: manually calling layoutSubviews shouldn't be needed?
+        () = msg![env; button layoutSubviews];
+
+        let label: id = msg![env; button titleLabel];
+        let font: id = msg_class![env; UIFont systemFontOfSize:(30.0 as CGFloat)];
+        () = msg![env; label setFont:font];
+
+        let selector = env.objc.lookup_selector("quickOptionsHide").unwrap();
+        () = msg![env; button addTarget:delegate
+                                 action:selector
+                       forControlEvents:UIControlEventTouchUpInside];
+        () = msg![env; main_view addSubview:button];
+    }
+
+    enum RowKind {
+        Label(&'static str),
+        Buttons(&'static [(&'static str, &'static str)]),
+        Switch(&'static str),
+    }
+    let rows = [
+        RowKind::Label("Scale hack"),
+        RowKind::Buttons(&[
+            ("Default", "scaleHackDefault"),
+            ("Off", "scaleHack1"),
+            ("2×", "scaleHack2"),
+            ("3×", "scaleHack3"),
+            ("4×", "scaleHack4"),
+        ]),
+        RowKind::Label("Orientation"),
+        RowKind::Buttons(&[
+            ("Default", "orientationDefault"),
+            ("←", "orientationLandscapeLeft"),
+            ("→", "orientationLandscapeRight"),
+        ]),
+        // ---- (divider for stuff skipped below)
+        RowKind::Label("Fullscreen (override)"),
+        RowKind::Switch("fullscreen:"),
+    ];
+    let rows_len_full = rows.len();
+    let rows = if crate::window::Window::rotatable_fullscreen() {
+        // Fullscreen option doesn't make sense on always-fullscreen platforms
+        &rows[..rows.len() - 2]
+    } else {
+        &rows[..]
+    };
+
+    let mut button_rows = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let row_center = divider
+            + ((1 + i) as CGFloat)
+                * ((main_frame.size.height - divider) / ((rows_len_full + 1) as CGFloat));
+
+        match *row {
+            RowKind::Label(text) => {
+                let frame = CGRect {
+                    origin: CGPoint {
+                        x: 0.0,
+                        y: row_center - 30.0 / 2.0,
+                    },
+                    size: CGSize {
+                        width: main_frame.size.width,
+                        height: 30.0,
+                    },
+                };
+
+                let label: id = msg_class![env; UILabel alloc];
+                let label: id = msg![env; label initWithFrame:frame];
+                let text = ns_string::get_static_str(env, text);
+                () = msg![env; label setText:text];
+                () = msg![env; label setTextAlignment:UITextAlignmentCenter];
+                () = msg![env; main_view addSubview:label];
+            }
+            RowKind::Buttons(buttons) => {
+                button_rows.push(make_button_row(
+                    env,
+                    delegate,
+                    main_view,
+                    main_frame.size,
+                    row_center,
+                    buttons,
+                    /* font_size: */ None,
+                ));
+            }
+            RowKind::Switch(selector) => {
+                let switch_frame = CGRect {
+                    origin: CGPoint {
+                        x: main_frame.size.width / 2.0 - 94.0 / 2.0,
+                        y: row_center - 27.0 / 2.0,
+                    },
+                    size: Default::default(),
+                };
+
+                let switch: id = msg_class![env; UISwitch alloc];
+                let switch: id = msg![env; switch initWithFrame:switch_frame];
+                let selector = env.objc.lookup_selector(selector).unwrap();
+                () = msg![env; switch addTarget:delegate
+                                         action:selector
+                               forControlEvents:UIControlEventValueChanged];
+                () = msg![env; main_view addSubview:switch];
+            }
+        }
+    }
+
+    QuickOptionsStuff {
+        main_view,
+        scale_hack_buttons: button_rows[0][..].try_into().unwrap(),
+        orientation_buttons: button_rows[1][..].try_into().unwrap(),
+    }
 }

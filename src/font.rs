@@ -86,20 +86,56 @@ impl Font {
         Font { font }
     }
 
+    pub fn mono_regular() -> Font {
+        Self::from_resource_file("LiberationMono-Regular.ttf")
+    }
+    pub fn mono_bold() -> Font {
+        Self::from_resource_file("LiberationMono-Bold.ttf")
+    }
+    pub fn mono_bold_italic() -> Font {
+        Self::from_resource_file("LiberationMono-BoldItalic.ttf")
+    }
+    pub fn mono_italic() -> Font {
+        Self::from_resource_file("LiberationMono-Italic.ttf")
+    }
     pub fn sans_regular() -> Font {
         Self::from_resource_file("LiberationSans-Regular.ttf")
     }
     pub fn sans_bold() -> Font {
         Self::from_resource_file("LiberationSans-Bold.ttf")
     }
+    pub fn sans_bold_italic() -> Font {
+        Self::from_resource_file("LiberationSans-BoldItalic.ttf")
+    }
     pub fn sans_italic() -> Font {
         Self::from_resource_file("LiberationSans-Italic.ttf")
+    }
+    pub fn serif_regular() -> Font {
+        Self::from_resource_file("LiberationSerif-Regular.ttf")
+    }
+    pub fn serif_bold() -> Font {
+        Self::from_resource_file("LiberationSerif-Bold.ttf")
+    }
+    pub fn serif_bold_italic() -> Font {
+        Self::from_resource_file("LiberationSerif-BoldItalic.ttf")
+    }
+    pub fn serif_italic() -> Font {
+        Self::from_resource_file("LiberationSerif-Italic.ttf")
     }
     pub fn sans_regular_ja() -> Font {
         Self::from_resource_file("NotoSansJP-Regular.otf")
     }
     pub fn sans_bold_ja() -> Font {
         Self::from_resource_file("NotoSansJP-Bold.otf")
+    }
+
+    pub fn ascent(&self, font_size: f32) -> f32 {
+        let v_metrics = self.font.v_metrics(scale(font_size));
+        v_metrics.ascent
+    }
+    pub fn descent(&self, font_size: f32) -> f32 {
+        let v_metrics = self.font.v_metrics(scale(font_size));
+        v_metrics.descent
     }
 
     fn line_height_and_gap(&self, font_size: f32) -> (f32, f32) {

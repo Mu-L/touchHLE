@@ -5,6 +5,7 @@
  */
 //! `AudioFile.h` (Audio File Services)
 
+use crate::abi::{CallFromHost, GuestFunction};
 use crate::audio; // Keep this module namespaced to avoid confusion
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::carbon_core::{eofErr, OSStatus};
@@ -21,7 +22,7 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct State {
-    audio_files: HashMap<AudioFileID, AudioFileHostObject>,
+    pub audio_files: HashMap<AudioFileID, AudioFileHostObject>,
 }
 impl State {
     pub fn get(framework_state: &mut crate::frameworks::State) -> &mut Self {
@@ -29,8 +30,8 @@ impl State {
     }
 }
 
-struct AudioFileHostObject {
-    audio_file: audio::AudioFile,
+pub struct AudioFileHostObject {
+    pub audio_file: audio::AudioFile,
 }
 
 #[repr(C, packed)]
@@ -41,15 +42,19 @@ unsafe impl SafeRead for OpaqueAudioFileID {}
 
 pub type AudioFileID = MutPtr<OpaqueAudioFileID>;
 
+#[allow(dead_code)]
 const kAudioFileFileNotFoundError: OSStatus = -43;
 const kAudioFileBadPropertySizeError: OSStatus = fourcc(b"!siz") as _;
 const kAudioFileUnsupportedProperty: OSStatus = fourcc(b"pty?") as _;
+const kAudioFileUnsupportedFileTypeError: OSStatus = fourcc(b"typ?") as _;
+const kAudioFileUnspecifiedError: OSStatus = fourcc(b"wht?") as _;
 
 type AudioFilePermissions = i8;
 pub const kAudioFileReadPermission: AudioFilePermissions = 1;
 
 /// Usually a FourCC.
 type AudioFileTypeID = u32;
+const kAudioFileCAFType: AudioFileTypeID = fourcc(b"caff");
 
 /// Usually a FourCC.
 type AudioFilePropertyID = u32;
@@ -73,15 +78,28 @@ pub fn AudioFileOpenURL(
 
     // The hint is optional and is supposed to only be used for certain file
     // formats that can't be uniquely identified, which we don't support so far.
-    assert!(in_file_type_hint == 0);
+    // Hints for well-known types are ignored as well.
+    match in_file_type_hint {
+        0 => {}
+        kAudioFileCAFType => {
+            log!("Ignoring 'caff' file type hint for AudioFileOpenURL()");
+        }
+        _ => unimplemented!(),
+    }
 
     let path = to_rust_path(env, in_file_ref);
-    let Ok(audio_file) = audio::AudioFile::open_for_reading(path, &env.fs) else {
-        log!(
-            "Warning: AudioFileOpenURL() for path {:?} failed",
-            in_file_ref
-        );
-        return kAudioFileFileNotFoundError;
+    let audio_file = match audio::AudioFile::open_for_reading(path, &env.fs) {
+        Ok(audio_file) => audio_file,
+        Err(error) => {
+            log!(
+                "Warning: AudioFileOpenURL() for path {:?} failed",
+                in_file_ref
+            );
+            return match error {
+                audio::AudioFileOpenError::FileDecodeError => kAudioFileUnsupportedFileTypeError,
+                _ => kAudioFileUnspecifiedError,
+            };
+        }
     };
 
     let host_object = AudioFileHostObject { audio_file };
@@ -96,6 +114,103 @@ pub fn AudioFileOpenURL(
     log_dbg!(
         "AudioFileOpenURL() opened path {:?}, new audio file handle: {:?}",
         in_file_ref,
+        guest_audio_file
+    );
+
+    0 // success
+}
+
+pub fn AudioFileOpenWithCallbacks(
+    env: &mut Environment,
+    client_data: MutVoidPtr,
+    // typedef OSStatus (*AudioFile_ReadProc)
+    //      (void *inClientData,
+    //       SInt64 inPosition,
+    //       UInt32 requestCount,
+    //       void *buffer,
+    //       UInt32 *actualCount);
+    read_callback: GuestFunction,
+    // typedef OSStatus (*AudioFile_WriteProc)
+    //      (void *inClientData,
+    //       SInt64 inPosition,
+    //       UInt32 requestCount,
+    //       const void *buffer,
+    //       UInt32 *actualCount);
+    _write_callback: GuestFunction,
+    // typedef SInt64 (*AudioFile_GetSizeProc)(void *inClientData);
+    getsize_callback: GuestFunction,
+    // typedef OSStatus (*AudioFile_SetSizeProc)
+    //      (void *inClientData, SInt64 inSize);
+    _setsize_callback: GuestFunction,
+    in_file_type_hint: AudioFileTypeID,
+    out_audio_file: MutPtr<AudioFileID>,
+) -> OSStatus {
+    if _write_callback.to_ptr().is_null() || _setsize_callback.to_ptr().is_null() {
+        log_dbg!("AudioFileOpenWithCallbacks() called with (unsupported) write({:?})/set_size({:?}) callbacks!",
+            _write_callback,
+            _setsize_callback);
+    }
+    // The hint is optional and is supposed to only be used for certain file
+    // formats that can't be uniquely identified, which we don't support so far.
+    if in_file_type_hint != 0 {
+        log!("Ignoring file type hint for AudioFileOpenWithCallbacks()");
+    }
+
+    // TODO: We're just reading in the whole file at once and parsing it here,
+    // this should change when streaming parsing is implemented.
+    let size: i64 = getsize_callback.call_from_host(env, (client_data,));
+    let size: u32 = size.try_into().unwrap();
+
+    assert!(
+        size != 0,
+        "0 byte size of file for AudioFileOpenWithCallbacks(), likely bad!"
+    );
+
+    let data_ptr: MutPtr<u8> = env.mem.alloc(size).cast();
+    let bytes_read_ptr: MutPtr<u32> = env.mem.alloc(guest_size_of::<u32>()).cast();
+
+    env.mem.write(bytes_read_ptr, 0);
+    log_dbg!(
+        "AudioFileOpenWithCallbacks() calling read: {:?}",
+        (client_data, 0_i64, size, data_ptr, bytes_read_ptr)
+    );
+    let status: OSStatus =
+        read_callback.call_from_host(env, (client_data, 0_i64, size, data_ptr, bytes_read_ptr));
+    if status != 0 {
+        log!(
+            "AudioFileOpenWithCallbacks() failed read, returning {}",
+            fourcc(&status.to_le_bytes())
+        );
+
+        return status;
+    }
+
+    assert!(
+        env.mem.read(bytes_read_ptr) == size,
+        "Bytes read != size for AudioFileOpenWithCallbacks(), likely bad!"
+    );
+
+    let data_vec = env
+        .mem
+        .bytes_at(data_ptr, env.mem.read(bytes_read_ptr))
+        .to_vec();
+
+    let Ok(audio_file) = audio::AudioFile::read_from_vec(data_vec) else {
+        log!("Warning: AudioFileOpenWithCallbacks() failed parse",);
+        return kAudioFileUnsupportedFileTypeError;
+    };
+    let guest_audio_file = env.mem.alloc_and_write(OpaqueAudioFileID { _filler: 0 });
+
+    let host_object = AudioFileHostObject { audio_file };
+
+    State::get(&mut env.framework_state)
+        .audio_files
+        .insert(guest_audio_file, host_object);
+
+    env.mem.write(out_audio_file, guest_audio_file);
+
+    log_dbg!(
+        "AudioFileOpenWithCallbacks() opened, new audio file handle: {:?}",
         guest_audio_file
     );
 
@@ -265,6 +380,29 @@ fn AudioFileReadBytes(
     }
 }
 
+fn AudioFileReadPacketData(
+    env: &mut Environment,
+    in_audio_file: AudioFileID,
+    in_use_cache: bool,
+    out_num_bytes: MutPtr<u32>,
+    out_packet_descriptions: MutVoidPtr, // unimplemented
+    in_starting_packet: i64,
+    io_num_packets: MutPtr<u32>,
+    out_buffer: MutVoidPtr,
+) -> OSStatus {
+    // TODO: real VBR support
+    AudioFileReadPackets(
+        env,
+        in_audio_file,
+        in_use_cache,
+        out_num_bytes,
+        out_packet_descriptions,
+        in_starting_packet,
+        io_num_packets,
+        out_buffer,
+    )
+}
+
 pub fn AudioFileReadPackets(
     env: &mut Environment,
     in_audio_file: AudioFileID,
@@ -279,7 +417,9 @@ pub fn AudioFileReadPackets(
 
     // Variable-size packets are not implemented currently. When they are,
     // this parameter should be a `MutPtr<AudioStreamPacketDescription>`.
-    assert!(out_packet_descriptions.is_null());
+    if !out_packet_descriptions.is_null() {
+        log!("Warning: ignoring non-null out_packet_descriptions in AudioFileReadPackets()");
+    }
 
     let host_object = State::get(&mut env.framework_state)
         .audio_files
@@ -314,10 +454,16 @@ pub fn AudioFileReadPackets(
 pub fn AudioFileClose(env: &mut Environment, in_audio_file: AudioFileID) -> OSStatus {
     return_if_null!(in_audio_file);
 
-    let _host_object = State::get(&mut env.framework_state)
+    let Some(_host_object) = State::get(&mut env.framework_state)
         .audio_files
         .remove(&in_audio_file)
-        .unwrap();
+    else {
+        log!(
+            "Bad AudioFileClose for {:?} (likely double close), ignoring!",
+            in_audio_file
+        );
+        return kAudioFileUnspecifiedError;
+    };
     env.mem.free(in_audio_file.cast());
     log_dbg!(
         "AudioFileClose() destroyed audio file handle: {:?}",
@@ -326,11 +472,26 @@ pub fn AudioFileClose(env: &mut Environment, in_audio_file: AudioFileID) -> OSSt
     0 // success
 }
 
+fn AudioFileStreamOpen(
+    _env: &mut Environment,
+    _in_client_data: MutVoidPtr,
+    _in_property_listener_proc: MutVoidPtr,
+    _in_packets_proc: MutVoidPtr,
+    _in_file_type_hint: AudioFileTypeID,
+    _out_audio_file_stream: MutVoidPtr,
+) -> OSStatus {
+    log!("TODO: AudioFileStreamOpen(), returning kAudioFileUnspecifiedError!");
+    kAudioFileUnspecifiedError
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioFileOpenURL(_, _, _, _)),
     export_c_func!(AudioFileGetPropertyInfo(_, _, _, _)),
     export_c_func!(AudioFileGetProperty(_, _, _, _)),
     export_c_func!(AudioFileReadBytes(_, _, _, _, _)),
     export_c_func!(AudioFileReadPackets(_, _, _, _, _, _, _)),
+    export_c_func!(AudioFileReadPacketData(_, _, _, _, _, _, _)),
+    export_c_func!(AudioFileOpenWithCallbacks(_, _, _, _, _, _, _)),
     export_c_func!(AudioFileClose(_)),
+    export_c_func!(AudioFileStreamOpen(_, _, _, _, _)),
 ];

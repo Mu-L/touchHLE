@@ -2,7 +2,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 [package]
-name = "touchHLE_dr_mp3_wrapper"
+name = "touchHLE_version"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -10,7 +10,9 @@ authors = { workspace = true }
 homepage = { workspace = true }
 
 [lib]
+name = "touchHLE_version"
 path = "lib.rs"
 
-[build-dependencies]
-cc = { workspace = true }
+[[bin]]
+name = "touchHLE_version_bin"
+path = "bin.rs"

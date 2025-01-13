@@ -5,8 +5,10 @@
  */
 //! `UIWindow`.
 
+use super::UIViewHostObject;
+use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::CGRect;
-use crate::objc::{id, msg, msg_super, objc_classes, ClassExports};
+use crate::objc::{id, msg, msg_class, msg_super, nil, objc_classes, ClassExports};
 
 #[derive(Default)]
 pub struct State {
@@ -14,6 +16,9 @@ pub struct State {
     ///
     /// This is public because Core Animation also uses it.
     pub visible_windows: Vec<id>,
+    /// The most recent window which received `makeKeyAndVisible` message.
+    /// Non-retaining!
+    pub key_window: Option<id>,
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -54,6 +59,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
+    if let Some(key_window) = env.framework_state.uikit.ui_view.ui_window.key_window {
+        if key_window == this {
+            env.framework_state.uikit.ui_view.ui_window.key_window = None;
+        }
+    }
     if !msg![env; this isHidden] {
         let visible_list = &mut env.framework_state.uikit.ui_view.ui_window.visible_windows;
         let idx = visible_list.iter().position(|&w| w == this).unwrap();
@@ -91,12 +101,75 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())makeKeyAndVisible {
-    // TODO: Set the "key" window once it's relevant. We don't currently have
-    // send any non-touch events to windows, so there's no meaning in it yet.
+    // TODO: We don't currently have send any non-touch events to windows,
+    // so there's no meaning in it yet.
+
+    assert!(env.framework_state.uikit.ui_view.ui_window.key_window.is_none());
+    env.framework_state.uikit.ui_view.ui_window.key_window = Some(this);
 
     msg![env; this setHidden:false]
+}
+
+// UIResponder implementation
+// From the Apple UIView docs regarding [UIResponder nextResponder]:
+// "UIWindow returns the application object."
+- (id)nextResponder {
+    msg_class![env; UIApplication sharedApplication]
+}
+
+- (())addSubview:(id)view {
+    log_dbg!("[(UIWindow*){:?} addSubview:{:?}] => ()", this, view);
+
+    if view == nil || env.objc.borrow::<UIViewHostObject>(view).view_controller == nil {
+        () = msg_super![env; this addSubview:view];
+        return;
+    }
+
+    // Below we treat a special case of adding view controller's view
+    // to a window, in order to generate display related notifications
+
+    if env.objc.borrow::<UIViewHostObject>(this).subviews.contains(&view) {
+        // For the case of existing view hidden by another view,
+        // we need to delay a below sequence up until obstructions are removed
+        log!("TODO: case of existing view hidden by another view for sending view[Will,Did]Appear");
+    }
+
+    let vc = env.objc.borrow::<UIViewHostObject>(view).view_controller;
+    () = msg![env; vc viewWillAppear:false];
+    () = msg_super![env; this addSubview:view];
+    () = msg![env; vc viewDidAppear:false];
 }
 
 @end
 
 };
+
+// TODO: more keyboard notifications
+pub const UIKeyboardWillShowNotification: &str = "UIKeyboardWillShowNotification";
+pub const UIKeyboardDidShowNotification: &str = "UIKeyboardDidShowNotification";
+pub const UIKeyboardWillHideNotification: &str = "UIKeyboardWillHideNotification";
+pub const UIKeyboardDidHideNotification: &str = "UIKeyboardDidHideNotification";
+pub const UIKeyboardBoundsUserInfoKey: &str = "UIKeyboardBoundsUserInfoKey";
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UIKeyboardWillShowNotification",
+        HostConstant::NSString(UIKeyboardWillShowNotification),
+    ),
+    (
+        "_UIKeyboardDidShowNotification",
+        HostConstant::NSString(UIKeyboardDidShowNotification),
+    ),
+    (
+        "_UIKeyboardWillHideNotification",
+        HostConstant::NSString(UIKeyboardWillHideNotification),
+    ),
+    (
+        "_UIKeyboardDidHideNotification",
+        HostConstant::NSString(UIKeyboardDidHideNotification),
+    ),
+    (
+        "_UIKeyboardBoundsUserInfoKey",
+        HostConstant::NSString(UIKeyboardBoundsUserInfoKey),
+    ),
+];

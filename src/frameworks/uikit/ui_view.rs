@@ -12,17 +12,23 @@ pub mod ui_alert_view;
 pub mod ui_control;
 pub mod ui_image_view;
 pub mod ui_label;
+pub mod ui_picker_view;
+pub mod ui_scroll_view;
+pub mod ui_web_view;
 pub mod ui_window;
 
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
-use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+use crate::frameworks::core_graphics::cg_affine_transform::{
+    CGAffineTransform, CGAffineTransformIdentity,
+};
+use crate::frameworks::core_graphics::cg_color::CGColorRef;
 use crate::frameworks::core_graphics::cg_context::{CGContextClearRect, CGContextRef};
-use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_array, NSInteger, NSUInteger};
 use crate::objc::{
-    autorelease, id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject,
-    NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
+    HostObject, NSZonePtr,
 };
 use crate::Environment;
 
@@ -40,6 +46,9 @@ pub(super) struct UIViewHostObject {
     subviews: Vec<id>,
     /// The superview. This is a weak reference.
     superview: id,
+    /// The view controller that controls this view. This is a weak reference
+    view_controller: id,
+    tag: NSInteger,
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
@@ -53,11 +62,18 @@ impl Default for UIViewHostObject {
             layer: nil,
             subviews: Vec::new(),
             superview: nil,
+            view_controller: nil,
+            tag: 0,
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
         }
     }
+}
+
+pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
+    let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
+    host_obj.view_controller = controller;
 }
 
 /// Shared parts of `initWithCoder:` and `initWithFrame:`. These can't call
@@ -140,18 +156,30 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_ns_string = get_static_str(env, "UIOpaque");
     let opaque: bool = msg![env; coder decodeBoolForKey:key_ns_string];
 
+    let key_ns_string = get_static_str(env, "UIBackgroundColor");
+    let bg_color: id = msg![env; coder decodeObjectForKey:key_ns_string];
+
+    let key_ns_string = get_static_str(env, "UITag");
+    let tag: NSInteger = msg![env; coder decodeIntegerForKey:key_ns_string];
+
+    let key_ns_string = get_static_str(env, "UIMultipleTouchEnabled");
+    let multi_touch_enabled: bool = msg![env; coder decodeBoolForKey:key_ns_string];
+
     let key_ns_string = get_static_str(env, "UISubviews");
     let subviews: id = msg![env; coder decodeObjectForKey:key_ns_string];
     let subview_count: NSUInteger = msg![env; subviews count];
 
     log_dbg!(
-        "[(UIView*){:?} initWithCoder:{:?}] => bounds {}, center {}, hidden {}, opaque {}, {} subviews",
+        "[(UIView*){:?} initWithCoder:{:?}] => bounds {}, center {}, hidden {}, bg color {:?}, tag {}, opaque {}, multi touch enabled {}, {} subviews",
         this,
         coder,
         bounds,
         center,
         hidden,
+        bg_color,
+        tag,
         opaque,
+        multi_touch_enabled,
         subview_count,
     );
 
@@ -159,6 +187,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setCenter:center];
     () = msg![env; this setHidden:hidden];
     () = msg![env; this setOpaque:opaque];
+    () = msg![env; this setBackgroundColor:bg_color];
+    () = msg![env; this setTag:tag];
+    () = msg![env; this setMultipleTouchEnabled:multi_touch_enabled];
 
     for i in 0..subview_count {
         let subview: id = msg![env; subviews objectAtIndex:i];
@@ -166,6 +197,30 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     this
+}
+
+- (NSInteger)tag {
+    env.objc.borrow::<UIViewHostObject>(this).tag
+}
+- (())setTag:(NSInteger)tag {
+    env.objc.borrow_mut::<UIViewHostObject>(this).tag = tag;
+}
+
+- (id)viewWithTag:(NSInteger)tag {
+    let &UIViewHostObject {
+        ref subviews,
+        tag: view_tag,
+        ..
+    } = env.objc.borrow(this);
+    if view_tag == tag {
+        return this;
+    }
+    for view in subviews {
+        if env.objc.borrow::<UIViewHostObject>(*view).tag == tag {
+            return *view;
+        }
+    }
+    nil
 }
 
 - (bool)isUserInteractionEnabled {
@@ -182,6 +237,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UIViewHostObject>(this).multiple_touch_enabled = enabled;
 }
 
+- (())setExclusiveTouch:(bool)exclusive {
+    log!("TODO: ignoring setExclusiveTouch:{} for view {:?}", exclusive, this);
+}
+
 - (())layoutSubviews {
     // On iOS 5.1 and earlier, the default implementation of this method does
     // nothing.
@@ -189,6 +248,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)superview {
     env.objc.borrow::<UIViewHostObject>(this).superview
+}
+
+- (id)window {
+    // Looks up window in the superview hierarchy
+    // TODO: cache the result somehow?
+    let mut window: id = env.objc.borrow::<UIViewHostObject>(this).superview;
+    let window_class = env.objc.get_known_class("UIWindow", &mut env.mem);
+    while window != nil {
+        let current_class: Class = msg![env; window class];
+        log_dbg!("maybe window {:?} curr class {}", window, env.objc.get_class_name(current_class));
+        if env.objc.class_is_subclass_of(current_class, window_class) {
+            break;
+        }
+        window = env.objc.borrow::<UIViewHostObject>(window).superview;
+    }
+    log_dbg!("view {:?} has window {:?}", this, window);
+    window
 }
 
 - (id)subviews {
@@ -223,6 +299,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (())insertSubview:(id)view belowSubview:(id)sibling {
+    retain(env, view);
+    () = msg![env; view removeFromSuperview];
+
+    let subview_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
+    subview_obj.superview = this;
+    let subview_layer = subview_obj.layer;
+
+    let sibling_layer = env.objc.borrow_mut::<UIViewHostObject>(sibling).layer;
+
+    let &mut UIViewHostObject {
+        ref mut subviews,
+        layer: this_layer,
+        ..
+    } = env.objc.borrow_mut(this);
+
+    let idx = subviews.iter().position(|&subview2| subview2 == sibling).unwrap();
+    subviews.insert(idx, view);
+
+    () = msg![env; this_layer insertSublayer:subview_layer below:sibling_layer];
+}
+
 - (())bringSubviewToFront:(id)subview {
     if subview == nil {
         // This happens in Touch & Go LITE. It's probably due to the ad classes
@@ -237,7 +335,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         ..
     } = env.objc.borrow_mut(this);
 
-    let idx = subviews.iter().position(|&subview2| subview2 == subview).unwrap();
+    let Some(idx) = subviews.iter().position(|&subview2| subview2 == subview) else {
+        log_dbg!("Warning: Unable to find the subview {:?} in subviews of {:?}", subview, this);
+        return;
+    };
     let subview2 = subviews.remove(idx);
     assert!(subview2 == subview);
     subviews.push(subview);
@@ -271,12 +372,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         layer,
         superview,
         subviews,
+        view_controller,
+        tag: _,
         clears_context_before_drawing: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
     release(env, layer);
+    assert!(view_controller == nil);
     assert!(superview == nil);
     for subview in subviews {
         env.objc.borrow_mut::<UIViewHostObject>(subview).superview = nil;
@@ -303,6 +407,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setHidden:hidden]
 }
 
+- (())setClipsToBounds:(bool)clips {
+    log!("TODO: [{:?} setClipsToBounds:{}]", this, clips);
+}
+
 - (bool)isOpaque {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer isOpaque]
@@ -321,15 +429,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setOpacity:alpha]
 }
 
-// FIXME: CALayer's backgroundColor should be a CGColorRef, which is supposedly
-// a separate type from UIColor. For now we have not implemented it and treat
-// them as the same type (and it seems like UIKit itself maybe did this once),
-// but eventually we'll have to do this properly.
 - (id)backgroundColor {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer backgroundColor]
+    let cg_color: CGColorRef = msg![env; layer backgroundColor];
+    msg_class![env; UIColor colorWithCGColor:cg_color]
 }
 - (())setBackgroundColor:(id)color { // UIColor*
+    let color: CGColorRef = msg![env; color CGColor];
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer setBackgroundColor:color]
 }
@@ -366,6 +472,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setFrame:frame]
 }
 
+- (CGAffineTransform)transform {
+    CGAffineTransformIdentity
+}
 - (())setTransform:(CGAffineTransform)transform {
     log!("TODO: [{:?} setTransform:{:?}]", this, transform);
 }
@@ -417,7 +526,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     for subview in subviews.into_iter().rev() { // later views are on top
         let hidden: bool = msg![env; subview isHidden];
         let alpha: CGFloat = msg![env; subview alpha];
-        let interactible: bool = msg![env; this isUserInteractionEnabled];
+        let interactible: bool = msg![env; subview isUserInteractionEnabled];
         if hidden || alpha < 0.01 || !interactible {
            continue;
         }
@@ -435,11 +544,49 @@ pub const CLASSES: ClassExports = objc_classes! {
     this
 }
 
+// Ending a view-editing session
+
+- (bool)endEditing:(bool)force {
+    assert!(force);
+    let responder: id = env.framework_state.uikit.ui_responder.first_responder;
+    let class = msg![env; responder class];
+    let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);
+    if responder != nil && env.objc.class_is_subclass_of(class, ui_text_field_class) {
+        // we need to check if text field is in the current view hierarchy
+        let mut to_find = responder;
+        while to_find != nil {
+            if to_find == this {
+                return msg![env; responder resignFirstResponder];
+            }
+            to_find = msg![env; to_find superview];
+        }
+    }
+    false
+}
+
+// UIResponder implementation
+// From the Apple UIView docs regarding [UIResponder nextResponder]:
+// "UIView implements this method and returns the UIViewController object that
+//  manages it (if it has one) or its superview (if it doesn’t)."
+- (id)nextResponder {
+    let host_object = env.objc.borrow::<UIViewHostObject>(this);
+    if host_object.view_controller != nil {
+        host_object.view_controller
+    } else {
+        host_object.superview
+    }
+}
+
 // Co-ordinate space conversion
 
 - (CGPoint)convertPoint:(CGPoint)point
                fromView:(id)other { // UIView*
-    assert!(other != nil); // TODO
+    if other == nil {
+        let window: id = msg![env; this window];
+        assert!(window != nil);
+        // TODO: also assert that window is a key one?
+        return msg![env; this convertPoint:point fromView:window]
+    }
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
     msg![env; this_layer convertPoint:point fromLayer:other_layer]
@@ -447,10 +594,50 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (CGPoint)convertPoint:(CGPoint)point
                  toView:(id)other { // UIView*
-    assert!(other != nil); // TODO
+    if other == nil {
+        let window: id = msg![env; this window];
+        assert!(window != nil);
+        // TODO: also assert that window is a key one?
+        return msg![env; this convertPoint:point toView:window]
+    }
     let this_layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     let other_layer = env.objc.borrow::<UIViewHostObject>(other).layer;
     msg![env; this_layer convertPoint:point toLayer:other_layer]
+}
+
+- (CGRect)convertRect:(CGRect)rect
+             fromView:(id)other { // UIView*
+    let new_origin: CGPoint = msg![env; this convertPoint:(rect.origin) fromView:other];
+    // Size is preserved
+    CGRect {
+        origin: new_origin,
+        size: rect.size
+    }
+}
+
+- (CGRect)convertRect:(CGRect)rect
+               toView:(id)other { // UIView*
+    let new_origin: CGPoint = msg![env; this convertPoint:(rect.origin) toView:other];
+    // Size is preserved
+    CGRect {
+        origin: new_origin,
+        size: rect.size
+    }
+}
+
+- (())setAutoresizingMask:(NSUInteger)mask {
+    log!("TODO: [(UIView*){:?} setAutoresizingMask:{}]", this, mask);
+}
+- (())setAutoresizesSubviews:(bool)enabled {
+    log!("TODO: [(UIView*){:?} setAutoresizesSubviews:{}]", this, enabled);
+}
+
+- (CGSize)sizeThatFits:(CGSize)size {
+    // default implementation, subclasses can override
+    size
+}
+- (())sizeToFit {
+    log!("TODO: [(UIView *){:?} sizeToFit]", this);
 }
 
 @end

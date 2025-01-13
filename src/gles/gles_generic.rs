@@ -51,15 +51,19 @@ pub trait GLES {
     unsafe fn GetFloatv(&mut self, pname: GLenum, params: *mut GLfloat);
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint);
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint);
+    unsafe fn GetTexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat);
     unsafe fn GetPointerv(&mut self, pname: GLenum, params: *mut *const GLvoid);
     unsafe fn Hint(&mut self, target: GLenum, mode: GLenum);
+    unsafe fn Finish(&mut self);
     unsafe fn Flush(&mut self);
+    #[allow(dead_code)]
     unsafe fn GetString(&mut self, name: GLenum) -> *const GLubyte;
 
     // Other state manipulation
     unsafe fn AlphaFunc(&mut self, func: GLenum, ref_: GLclampf);
     unsafe fn AlphaFuncx(&mut self, func: GLenum, ref_: GLclampx);
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum);
+    unsafe fn BlendEquationOES(&mut self, mode: GLenum);
     unsafe fn ColorMask(
         &mut self,
         red: GLboolean,
@@ -67,6 +71,8 @@ pub trait GLES {
         blue: GLboolean,
         alpha: GLboolean,
     );
+    unsafe fn ClipPlanef(&mut self, plane: GLenum, equation: *const GLfloat);
+    unsafe fn ClipPlanex(&mut self, plane: GLenum, equation: *const GLfixed);
     unsafe fn CullFace(&mut self, mode: GLenum);
     unsafe fn DepthFunc(&mut self, func: GLenum);
     unsafe fn DepthMask(&mut self, flag: GLboolean);
@@ -80,6 +86,9 @@ pub trait GLES {
     unsafe fn Viewport(&mut self, x: GLint, y: GLint, width: GLsizei, height: GLsizei);
     unsafe fn LineWidth(&mut self, val: GLfloat);
     unsafe fn LineWidthx(&mut self, val: GLfixed);
+    unsafe fn StencilFunc(&mut self, func: GLenum, ref_: GLint, mask: GLuint);
+    unsafe fn StencilOp(&mut self, sfail: GLenum, dpfail: GLenum, dppass: GLenum);
+    unsafe fn StencilMask(&mut self, mask: GLuint);
 
     // Points
     unsafe fn PointSize(&mut self, size: GLfloat);
@@ -99,13 +108,16 @@ pub trait GLES {
     unsafe fn Lightfv(&mut self, light: GLenum, pname: GLenum, params: *const GLfloat);
     unsafe fn Lightxv(&mut self, light: GLenum, pname: GLenum, params: *const GLfixed);
     unsafe fn LightModelf(&mut self, pname: GLenum, param: GLfloat);
+    unsafe fn LightModelx(&mut self, pname: GLenum, param: GLfixed);
     unsafe fn LightModelfv(&mut self, pname: GLenum, params: *const GLfloat);
+    unsafe fn LightModelxv(&mut self, pname: GLenum, params: *const GLfixed);
     unsafe fn Materialf(&mut self, face: GLenum, pname: GLenum, param: GLfloat);
     unsafe fn Materialx(&mut self, face: GLenum, pname: GLenum, param: GLfixed);
     unsafe fn Materialfv(&mut self, face: GLenum, pname: GLenum, params: *const GLfloat);
     unsafe fn Materialxv(&mut self, face: GLenum, pname: GLenum, params: *const GLfixed);
 
     // Buffers
+    unsafe fn IsBuffer(&mut self, buffer: GLuint) -> GLboolean;
     unsafe fn GenBuffers(&mut self, n: GLsizei, buffers: *mut GLuint);
     unsafe fn DeleteBuffers(&mut self, n: GLsizei, buffers: *const GLuint);
     unsafe fn BindBuffer(&mut self, target: GLenum, buffer: GLuint);
@@ -200,6 +212,7 @@ pub trait GLES {
     unsafe fn GenTextures(&mut self, n: GLsizei, textures: *mut GLuint);
     unsafe fn DeleteTextures(&mut self, n: GLsizei, textures: *const GLuint);
     unsafe fn ActiveTexture(&mut self, texture: GLenum);
+    unsafe fn IsTexture(&mut self, texture: GLuint) -> GLboolean;
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint);
     unsafe fn TexParameteri(&mut self, target: GLenum, pname: GLenum, param: GLint);
     unsafe fn TexParameterf(&mut self, target: GLenum, pname: GLenum, param: GLfloat);
@@ -350,6 +363,13 @@ pub trait GLES {
         texture: GLuint,
         level: i32,
     );
+    unsafe fn GetFramebufferAttachmentParameterivOES(
+        &mut self,
+        target: GLenum,
+        attachment: GLenum,
+        pname: GLenum,
+        params: *mut GLint,
+    );
     unsafe fn GetRenderbufferParameterivOES(
         &mut self,
         target: GLenum,
@@ -360,4 +380,7 @@ pub trait GLES {
     unsafe fn DeleteFramebuffersOES(&mut self, n: GLsizei, framebuffers: *const GLuint);
     unsafe fn DeleteRenderbuffersOES(&mut self, n: GLsizei, renderbuffers: *const GLuint);
     unsafe fn GenerateMipmapOES(&mut self, target: GLenum);
+    unsafe fn GetBufferParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint);
+    unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid;
+    unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean;
 }

@@ -69,6 +69,14 @@ pub const CLASSES: ClassExports = objc_classes! {
          selector:(SEL)selector
              name:(NSNotificationName)name
            object:(id)object {
+    if name == nil &&
+        env.bundle.bundle_identifier().starts_with("com.chillingo.cuttherope") &&
+        selector == env.objc.lookup_selector("fetchUpdateNotification:").unwrap() {
+        // As we nullified Flurry SDK, we also need to no-op
+        // related notifications
+        log!("Applying game-specific hack for Cut the Rope: ignoring addObserver:selector:name:object: for fetchUpdateNotification:");
+        return;
+    }
     // TODO: handle case where name is nil
     // Usually a static string, so no real copy will happen
     let name = ns_string::to_rust_string(env, name);
@@ -93,14 +101,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     });
 }
 
+- (())removeObserver:(id)observer {
+    msg![env; this removeObserver:observer name:nil object:nil]
+}
+
 - (())removeObserver:(id)observer
                 name:(NSNotificationName)name
               object:(id)object {
     assert!(observer != nil); // TODO
 
-    // TODO: handle case where name is nil
-    // Usually a static string, so no real copy will happen
-    let name = ns_string::to_rust_string(env, name);
+    let name = if name == nil {
+        None
+    } else {
+        // Usually a static string, so no real copy will happen
+        Some(ns_string::to_rust_string(env, name))
+    };
 
     log_dbg!(
         "[(NSNotificationCenter*){:?} removeObserver:{:?} name:{:?} object:{:?}",
@@ -110,23 +125,21 @@ pub const CLASSES: ClassExports = objc_classes! {
         object,
     );
 
-    let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
-    let Some(observers) = host_obj.observers.get_mut(&name) else {
-        return;
-    };
-
     // TODO: is this the correct behaviour, can an observer be registered
     // several times?
     let mut removed_observers = Vec::new();
 
-    let mut i = 0;
-    while i < observers.len() {
-        if observers[i].observer == observer && (object == nil || object == observers[i].object) {
-            removed_observers.push(observers.swap_remove(i));
-        } else {
-            i += 1;
+    let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
+    if let Some(ref name) = name {
+        let Some(observers) = host_obj.observers.get_mut(name) else {
+            return;
+        };
+        remove_observers_internal(observers, &mut removed_observers, observer, object);
+    } else {
+        for observers in host_obj.observers.values_mut() {
+            remove_observers_internal(observers, &mut removed_observers, observer, object);
         }
-    }
+    };
 
     for removed_observer in removed_observers {
         release(env, removed_observer.observer);
@@ -167,8 +180,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             observer
         );
 
+        // In some cases, observer could be removed during the
+        // processing of the notification, effectively releasing it.
+        // (This is happening with Spore Origins)
+        // We need to retain it for correctness.
+        retain(env, observer);
         // Signature should be `- (void)notification:(NSNotification *)notif`.
         let _: () = msg_send(env, (observer, selector, notification));
+        release(env, observer);
     }
 }
 - (())postNotificationName:(NSNotificationName)name
@@ -191,3 +210,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// A helper function to populate `removed_observers` with observers
+/// removed from `observers` based on `observer` and `object` criteria.
+fn remove_observers_internal(
+    observers: &mut Vec<Observer>,
+    removed_observers: &mut Vec<Observer>,
+    observer: id,
+    object: id,
+) {
+    let mut i = 0;
+    while i < observers.len() {
+        if observers[i].observer == observer && (object == nil || object == observers[i].object) {
+            removed_observers.push(observers.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+}

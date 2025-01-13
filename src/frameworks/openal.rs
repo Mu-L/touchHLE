@@ -130,10 +130,18 @@ fn alcDestroyContext(env: &mut Environment, context: MutPtr<GuestALCcontext>) {
 }
 
 fn alcProcessContext(env: &mut Environment, context: MutPtr<GuestALCcontext>) {
+    if context.is_null() {
+        log!("alcProcessContext() is called with NULL context, ignoring");
+        return;
+    }
     let host_context = State::get(env).contexts.get(&context).copied().unwrap();
     unsafe { al::alcProcessContext(host_context) }
 }
 fn alcSuspendContext(env: &mut Environment, context: MutPtr<GuestALCcontext>) {
+    if context.is_null() {
+        log!("alcSuspendContext() is called with NULL context, ignoring");
+        return;
+    }
     let host_context = State::get(env).contexts.get(&context).copied().unwrap();
     unsafe { al::alcSuspendContext(host_context) }
 }
@@ -181,7 +189,7 @@ fn alcGetProcAddress(
     env: &mut Environment,
     _device: ConstPtr<GuestALCdevice>,
     func_name: ConstPtr<u8>,
-) -> ConstVoidPtr {
+) -> MutVoidPtr {
     let mangled_func_name = format!("_{}", env.mem.cstr_at_utf8(func_name).unwrap());
     assert!(mangled_func_name.starts_with("_al"));
 
@@ -191,6 +199,10 @@ fn alcGetProcAddress(
     {
         Ptr::from_bits(ptr.addr_with_thumb_bit())
     } else {
+        if mangled_func_name == "_alcMacOSMixerOutputRate" {
+            log!("Tolerating nonexistent alcMacOSMixerOutputRate() func in alcGetProcAddress(), returning NULL.");
+            return Ptr::null();
+        }
         panic!(
             "Request for procedure address for unimplemented OpenAL function {}",
             mangled_func_name
@@ -236,6 +248,10 @@ fn alIsBuffer(_env: &mut Environment, buffer: ALuint) -> ALboolean {
 
 fn alIsSource(_env: &mut Environment, source: ALuint) -> ALboolean {
     unsafe { al::alIsSource(source) }
+}
+
+fn alEnable(_env: &mut Environment, capability: ALenum) {
+    unsafe { al::alEnable(capability) };
 }
 
 fn alListenerf(_env: &mut Environment, param: ALenum, value: ALfloat) {
@@ -504,16 +520,13 @@ fn alBufferData(
     samplerate: ALsizei,
 ) {
     let size_usize: GuestUSize = size.try_into().unwrap();
-    let data_slice = env.mem.bytes_at(data.cast(), size_usize);
-    unsafe {
-        al::alBufferData(
-            buffer,
-            format,
-            data_slice.as_ptr() as *const _,
-            size,
-            samplerate,
-        )
+    let data_ptr: *const ALvoid = if data.is_null() {
+        std::ptr::null()
+    } else {
+        let data_slice = env.mem.bytes_at(data.cast(), size_usize);
+        data_slice.as_ptr() as *const _
     };
+    unsafe { al::alBufferData(buffer, format, data_ptr, size, samplerate) };
 }
 
 /// This is an Apple extension that treats the data passed as a static buffer
@@ -535,6 +548,11 @@ fn alBufferDataStatic(
 fn alcMacOSXMixerOutputRate(_env: &mut Environment, value: ALdouble) {
     log!("App wants to set mixer output sample rate to {} Hz", value);
 }
+fn alcMacOSXGetMixerOutputRate(_env: &mut Environment) -> ALdouble {
+    // Default was checked on iPhone 3GS, iOS 4.0.1
+    log!("App wants to get mixer output sample rate, returning default 0");
+    0.0
+}
 
 fn alDopplerFactor(_env: &mut Environment, value: ALfloat) {
     unsafe { al::alDopplerFactor(value) };
@@ -546,13 +564,19 @@ fn alDopplerVelocity(env: &mut Environment, value: ALfloat) {
     // Check "A note for OpenAL library implementors regarding OpenAL 1.0" from
     // OpenAL 1.1 specs for more info
     let bundle_id = env.bundle.bundle_identifier();
-    if bundle_id.starts_with("com.zodttd.wolf3d") || bundle_id.starts_with("com.idsoftware.wolf3d")
+    if bundle_id.starts_with("com.zodttd.wolf3d")
+        || bundle_id.starts_with("com.idsoftware.wolf3d")
+        || bundle_id.starts_with("nu.r3.wolf3d")
     {
         log_dbg!("Applying game-specific hack for Wolf3D-iOS: ignoring 0.0 doppler velocity.");
         assert_eq!(value, 0.0);
         return;
     }
     unsafe { al::alDopplerVelocity(value) };
+}
+
+fn alSpeedOfSound(_env: &mut Environment, value: ALfloat) {
+    unsafe { al::alSpeedOfSound(value) };
 }
 
 // TODO: more functions
@@ -589,9 +613,6 @@ fn alGetBufferf(_env: &mut Environment, _buffer: ALuint, _param: ALenum, _value:
 fn alGetBufferi(_env: &mut Environment, _buffer: ALuint, _param: ALenum, _value: MutPtr<ALint>) {
     todo!();
 }
-fn alEnable(_env: &mut Environment, _capability: ALenum) {
-    todo!();
-}
 fn alDisable(_env: &mut Environment, _capability: ALenum) {
     todo!();
 }
@@ -619,8 +640,8 @@ fn alGetInteger(_env: &mut Environment, _param: ALenum) -> ALint {
 fn alGetIntegerv(_env: &mut Environment, _param: ALenum, _values: MutPtr<ALint>) {
     todo!();
 }
-fn alGetProcAddress(_env: &mut Environment, _funcName: ConstPtr<u8>) -> MutVoidPtr {
-    todo!();
+fn alGetProcAddress(env: &mut Environment, funcName: ConstPtr<u8>) -> MutVoidPtr {
+    alcGetProcAddress(env, Ptr::null(), funcName)
 }
 fn alGetString(_env: &mut Environment, _param: ALenum) -> ConstPtr<u8> {
     todo!();
@@ -693,6 +714,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(alBufferData(_, _, _, _, _)),
     export_c_func!(alBufferDataStatic(_, _, _, _, _)),
     export_c_func!(alcMacOSXMixerOutputRate(_)),
+    export_c_func!(alcMacOSXGetMixerOutputRate()),
     export_c_func!(alcGetContextsDevice(_)),
     export_c_func!(alcGetCurrentContext()),
     export_c_func!(alcGetEnumValue(_, _)),
@@ -731,4 +753,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(alSourcePausev(_, _)),
     export_c_func!(alSourceStopv(_, _)),
     export_c_func!(alSourceRewindv(_, _)),
+    export_c_func!(alSpeedOfSound(_)),
 ];

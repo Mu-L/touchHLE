@@ -10,6 +10,7 @@ pub mod stat;
 use crate::abi::DotDotDot;
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::fs::{GuestFile, GuestOpenOptions, GuestPath};
+use crate::libc::errno::{set_errno, EBADF};
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, MutPtr, MutVoidPtr, Ptr};
 use crate::Environment;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -29,6 +30,7 @@ impl State {
 
 struct PosixFileHostObject {
     file: GuestFile,
+    needs_flush: bool,
     reached_eof: bool,
 }
 
@@ -66,6 +68,12 @@ pub const O_CREAT: OpenFlag = 0x200;
 pub const O_TRUNC: OpenFlag = 0x400;
 pub const O_EXCL: OpenFlag = 0x800;
 
+/// File control command flags.
+/// This alias is for readability, POSIX just uses `int`.
+pub type FileControlCommand = i32;
+const F_RDADVISE: FileControlCommand = 44;
+const F_NOCACHE: FileControlCommand = 48;
+
 pub type FLockFlag = i32;
 pub const LOCK_SH: FLockFlag = 1;
 #[allow(dead_code)]
@@ -76,6 +84,9 @@ pub const LOCK_NB: FLockFlag = 4;
 pub const LOCK_UN: FLockFlag = 8;
 
 fn open(env: &mut Environment, path: ConstPtr<u8>, flags: i32, _args: DotDotDot) -> FileDescriptor {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     // TODO: parse variadic arguments and pass them on (file creation mode)
     self::open_direct(env, path, flags)
 }
@@ -105,11 +116,20 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
 
     // TODO: respect the mode (in the variadic arguments) when creating a file
     // Note: NONBLOCK flag is ignored, assumption is all file I/O is fast
+    let mut needs_flush = false;
     let mut options = GuestOpenOptions::new();
     match flags & O_ACCMODE {
-        O_RDONLY => options.read(),
-        O_WRONLY => options.write(),
-        O_RDWR => options.read().write(),
+        O_RDONLY => {
+            options.read();
+        }
+        O_WRONLY => {
+            options.write();
+            needs_flush = true;
+        }
+        O_RDWR => {
+            options.read().write();
+            needs_flush = true;
+        }
         _ => panic!(),
     };
     if (flags & O_APPEND) != 0 {
@@ -145,6 +165,7 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         Ok(file) => {
             let host_object = PosixFileHostObject {
                 file,
+                needs_flush,
                 reached_eof: false,
             };
 
@@ -189,8 +210,24 @@ pub fn read(
     buffer: MutVoidPtr,
     size: GuestUSize,
 ) -> GuestISize {
-    // TODO: error handling for unknown fd?
-    let file = env.libc_state.posix_io.file_for_fd(fd).unwrap();
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    if buffer.is_null() {
+        // TODO: set errno to EFAULT
+        return -1;
+    }
+
+    let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
+        log!(
+            "Warning: read({:?}, {:?}, {:#x}) called with unknown fd, returning -1",
+            fd,
+            buffer,
+            size,
+        );
+        // TODO: set errno
+        return -1;
+    };
 
     let buffer_slice = env.mem.bytes_at_mut(buffer.cast(), size);
     match file.file.read(buffer_slice) {
@@ -242,12 +279,39 @@ pub(super) fn eof(env: &mut Environment, fd: FileDescriptor) -> i32 {
     }
 }
 
+/// Helper for C `clearerr()`.
+pub(super) fn clearerr(env: &mut Environment, fd: FileDescriptor) {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    let file = env.libc_state.posix_io.file_for_fd(fd).unwrap();
+    file.reached_eof = false;
+}
+
+/// Helper for C `fflush()`.
+pub(super) fn fflush(env: &mut Environment, fd: FileDescriptor) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
+        // TODO: set errno to EBADF
+        return -1;
+    };
+    match file.file.flush() {
+        Ok(_) => 0,
+        Err(_) => -1,
+    }
+}
+
 pub fn write(
     env: &mut Environment,
     fd: FileDescriptor,
     buffer: ConstVoidPtr,
     size: GuestUSize,
 ) -> GuestISize {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     // TODO: error handling for unknown fd?
     let file = env.libc_state.posix_io.file_for_fd(fd).unwrap();
 
@@ -293,8 +357,14 @@ pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
 pub const SEEK_END: i32 = 2;
 pub fn lseek(env: &mut Environment, fd: FileDescriptor, offset: off_t, whence: i32) -> off_t {
-    // TODO: error handling for unknown fd?
-    let file = env.libc_state.posix_io.file_for_fd(fd).unwrap();
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    let Some(file) = env.libc_state.posix_io.file_for_fd(fd) else {
+        log_dbg!("lseek({:?}, {:#x}, {}) => {}", fd, offset, whence, -1);
+        // TODO: set errno
+        return -1;
+    };
 
     let from = match whence {
         // not sure whether offset is treated as signed or unsigned when using
@@ -321,34 +391,64 @@ pub fn lseek(env: &mut Environment, fd: FileDescriptor, offset: off_t, whence: i
 }
 
 pub fn close(env: &mut Environment, fd: FileDescriptor) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     // TODO: error handling for unknown fd?
     if fd < 0 || matches!(fd, STDOUT_FILENO | STDERR_FILENO) {
         return 0;
     }
 
-    match env.libc_state.posix_io.files[fd_to_file_idx(fd)].take() {
+    let result = match env.libc_state.posix_io.files[fd_to_file_idx(fd)].take() {
         Some(file) => {
             // The actual closing of the file happens implicitly when `file`
-            // falls out of scope. The return value is about whether flushing
-            // succeeds.
-            match file.file.sync_all() {
-                Ok(()) => {
-                    log_dbg!("close({:?}) => 0", fd);
-                    0
-                }
-                Err(_) => {
-                    // TODO: set errno
-                    log!("Warning: close({:?}) failed, returning -1", fd);
-                    -1
+            // falls out of scope. The return value is about whether actions
+            // performed before closing succeed or not.
+            match file.file {
+                // Closing directories requires no other actions
+                GuestFile::Directory => 0,
+                // Files must be synced if they require flushing
+                _ => {
+                    if !file.needs_flush {
+                        0
+                    } else {
+                        match file.file.sync_all() {
+                            Ok(()) => 0,
+                            Err(_) => {
+                                // TODO: set errno
+                                -1
+                            }
+                        }
+                    }
                 }
             }
         }
         None => {
             // TODO: set errno
-            log!("Warning: close({:?}) failed, returning -1", fd);
             -1
         }
+    };
+
+    if result == 0 {
+        log_dbg!("close({:?}) => 0", fd);
+    } else {
+        log!("Warning: close({:?}) failed, returning -1", fd);
     }
+    result
+}
+
+fn rename(env: &mut Environment, old: ConstPtr<u8>, new: ConstPtr<u8>) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    let old = env.mem.cstr_at_utf8(old).unwrap();
+    let new = env.mem.cstr_at_utf8(new).unwrap();
+    let res = match env.fs.rename(GuestPath::new(&old), GuestPath::new(&new)) {
+        Ok(_) => 0,
+        Err(_) => -1,
+    };
+    log_dbg!("rename('{}', '{}') => {}", old, new, res);
+    res
 }
 
 pub fn getcwd(env: &mut Environment, buf_ptr: MutPtr<u8>, buf_size: GuestUSize) -> MutPtr<u8> {
@@ -402,6 +502,9 @@ pub fn getcwd(env: &mut Environment, buf_ptr: MutPtr<u8>, buf_size: GuestUSize) 
 }
 
 fn chdir(env: &mut Environment, path_ptr: ConstPtr<u8>) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     let path = GuestPath::new(env.mem.cstr_at_utf8(path_ptr).unwrap());
     match env.fs.change_working_directory(path) {
         Ok(new) => {
@@ -421,12 +524,57 @@ fn chdir(env: &mut Environment, path_ptr: ConstPtr<u8>) -> i32 {
 }
 // TODO: fchdir(), once open() on a directory is supported.
 
-fn flock(_env: &mut Environment, fd: FileDescriptor, operation: FLockFlag) -> i32 {
+fn fcntl(
+    env: &mut Environment,
+    fd: FileDescriptor,
+    cmd: FileControlCommand,
+    args: DotDotDot,
+) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
+    if fd >= NORMAL_FILENO_BASE
+        && env
+            .libc_state
+            .posix_io
+            .files
+            .get(fd_to_file_idx(fd))
+            .is_none()
+    {
+        set_errno(env, EBADF);
+        return -1;
+    }
+
+    match cmd {
+        F_NOCACHE => {
+            let mut args = args.start();
+            let arg: i32 = args.next(env);
+            assert_eq!(arg, 1);
+            log!(
+                "TODO: Ignoring enabling F_NOCACHE for file descriptor {}",
+                fd
+            );
+        }
+        F_RDADVISE => {
+            log_dbg!("TODO: Ignoring F_RDADVISE for file descriptor {}", fd);
+        }
+        _ => unimplemented!(),
+    }
+    0 // success
+}
+
+fn flock(env: &mut Environment, fd: FileDescriptor, operation: FLockFlag) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     log!("TODO: flock({:?}, {:?})", fd, operation);
     0
 }
 
 fn ftruncate(env: &mut Environment, fd: FileDescriptor, len: off_t) -> i32 {
+    // TODO: handle errno properly
+    set_errno(env, 0);
+
     let file = env.libc_state.posix_io.file_for_fd(fd).unwrap();
     match file.file.set_len(len as u64) {
         Ok(()) => 0,
@@ -440,8 +588,10 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(write(_, _, _)),
     export_c_func!(lseek(_, _, _)),
     export_c_func!(close(_)),
+    export_c_func!(rename(_, _)),
     export_c_func!(getcwd(_, _)),
     export_c_func!(chdir(_)),
+    export_c_func!(fcntl(_, _, _)),
     export_c_func!(flock(_, _)),
     export_c_func!(ftruncate(_, _)),
 ];

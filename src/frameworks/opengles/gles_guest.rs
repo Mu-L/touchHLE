@@ -12,11 +12,20 @@
 //! depending on the value of `pname`, using the upper bound (4 in this case)
 //! every time is never going to cause a problem in practice.
 
+use touchHLE_gl_bindings::gles11::{
+    ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, VERTEX_ARRAY_BUFFER_BINDING,
+    WRITE_ONLY_OES,
+};
+
 use crate::dyld::{export_c_func, FunctionExports};
+use crate::frameworks::opengles::eagl::EAGLContextHostObject;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::GLES;
-use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr};
+use crate::objc::nil;
 use crate::Environment;
+
+use std::slice::from_raw_parts;
 
 // These types are the same size in guest code (32-bit) and host code (64-bit).
 use crate::gles::gles11_raw::types::{
@@ -27,6 +36,27 @@ use crate::gles::gles11_raw::types::{
 use crate::gles::gles11_raw::types::{GLintptr as HostGLintptr, GLsizeiptr as HostGLsizeiptr};
 type GuestGLsizeiptr = GuestISize;
 type GuestGLintptr = GuestISize;
+
+/// List of compressed formats supported by our emulation.
+/// Currently, it's all the PVRTC and all paletted ones.
+const SUPPORTED_COMPRESSED_TEXTURE_FORMATS: &[GLenum] = &[
+    // PVRTC
+    gles11::COMPRESSED_RGBA_PVRTC_2BPPV1_IMG,
+    gles11::COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+    gles11::COMPRESSED_RGB_PVRTC_2BPPV1_IMG,
+    gles11::COMPRESSED_RGB_PVRTC_4BPPV1_IMG,
+    // Paletted texture
+    gles11::PALETTE4_R5_G6_B5_OES,
+    gles11::PALETTE4_RGB5_A1_OES,
+    gles11::PALETTE4_RGB8_OES,
+    gles11::PALETTE4_RGBA4_OES,
+    gles11::PALETTE4_RGBA8_OES,
+    gles11::PALETTE8_R5_G6_B5_OES,
+    gles11::PALETTE8_RGB5_A1_OES,
+    gles11::PALETTE8_RGB8_OES,
+    gles11::PALETTE8_RGBA4_OES,
+    gles11::PALETTE8_RGBA8_OES,
+];
 
 fn with_ctx_and_mem<T, U>(env: &mut Environment, f: T) -> U
 where
@@ -80,10 +110,8 @@ fn glEnable(env: &mut Environment, cap: GLenum) {
         unsafe { gles.Enable(cap) };
     });
 }
-fn glIsEnabled(env: &mut Environment, cap: GLenum) {
-    with_ctx_and_mem(env, |gles, _mem| {
-        unsafe { gles.IsEnabled(cap) };
-    });
+fn glIsEnabled(env: &mut Environment, cap: GLenum) -> GLboolean {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsEnabled(cap) })
 }
 fn glDisable(env: &mut Environment, cap: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| {
@@ -112,6 +140,8 @@ fn glGetBooleanv(env: &mut Environment, pname: GLenum, params: MutPtr<GLboolean>
     });
 }
 fn glGetFloatv(env: &mut Environment, pname: GLenum, params: MutPtr<GLfloat>) {
+    assert_ne!(gles11::NUM_COMPRESSED_TEXTURE_FORMATS, pname);
+    assert_ne!(gles11::COMPRESSED_TEXTURE_FORMATS, pname);
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at_mut(params, 16 /* upper bound */);
         unsafe { gles.GetFloatv(pname, params) };
@@ -119,8 +149,34 @@ fn glGetFloatv(env: &mut Environment, pname: GLenum, params: MutPtr<GLfloat>) {
 }
 fn glGetIntegerv(env: &mut Environment, pname: GLenum, params: MutPtr<GLint>) {
     with_ctx_and_mem(env, |gles, mem| {
-        let params = mem.ptr_at_mut(params, 16 /* upper bound */);
-        unsafe { gles.GetIntegerv(pname, params) };
+        match pname {
+            gles11::NUM_COMPRESSED_TEXTURE_FORMATS => {
+                mem.write(params, SUPPORTED_COMPRESSED_TEXTURE_FORMATS.len() as _);
+            }
+            gles11::COMPRESSED_TEXTURE_FORMATS => {
+                for (idx, &format) in SUPPORTED_COMPRESSED_TEXTURE_FORMATS.iter().enumerate() {
+                    mem.write(params + idx as GuestUSize, format as _);
+                }
+            }
+            _ => {
+                let params = mem.ptr_at_mut(params, 16 /* upper bound */);
+                unsafe { gles.GetIntegerv(pname, params) };
+            }
+        }
+    });
+}
+fn glGetPointerv(env: &mut Environment, pname: GLenum, params: MutPtr<ConstVoidPtr>) {
+    use crate::gles::gles1_on_gl2::{ArrayInfo, ARRAYS};
+    let &ArrayInfo { buffer_binding, .. } =
+        ARRAYS.iter().find(|info| info.pointer == pname).unwrap();
+    with_ctx_and_mem(env, |gles, mem| {
+        // params always points to just one pointer for this function
+        let mut host_pointer_or_offset = std::ptr::null();
+        let guest_pointer_or_offset = unsafe {
+            gles.GetPointerv(pname, &mut host_pointer_or_offset);
+            translate_pointer_or_offset_to_guest(gles, mem, host_pointer_or_offset, buffer_binding)
+        };
+        mem.write(params, guest_pointer_or_offset);
     });
 }
 fn glGetTexEnviv(env: &mut Environment, target: GLenum, pname: GLenum, params: MutPtr<GLint>) {
@@ -129,8 +185,18 @@ fn glGetTexEnviv(env: &mut Environment, target: GLenum, pname: GLenum, params: M
         unsafe { gles.GetTexEnviv(target, pname, params) };
     });
 }
+fn glGetTexEnvfv(env: &mut Environment, target: GLenum, pname: GLenum, params: MutPtr<GLfloat>) {
+    with_ctx_and_mem(env, |gles, mem| {
+        let params = mem.ptr_at_mut(params, 16 /* upper bound */);
+        unsafe { gles.GetTexEnvfv(target, pname, params) };
+    });
+}
+
 fn glHint(env: &mut Environment, target: GLenum, mode: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Hint(target, mode) })
+}
+fn glFinish(env: &mut Environment) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Finish() })
 }
 fn glFlush(env: &mut Environment) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.Flush() })
@@ -180,6 +246,9 @@ fn glBlendFunc(env: &mut Environment, sfactor: GLenum, dfactor: GLenum) {
         gles.BlendFunc(sfactor, dfactor)
     })
 }
+fn glBlendEquationOES(env: &mut Environment, mode: GLenum) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.BlendEquationOES(mode) })
+}
 fn glColorMask(
     env: &mut Environment,
     red: GLboolean,
@@ -189,6 +258,18 @@ fn glColorMask(
 ) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
         gles.ColorMask(red, green, blue, alpha)
+    })
+}
+fn glClipPlanef(env: &mut Environment, plane: GLenum, equation: ConstPtr<GLfloat>) {
+    with_ctx_and_mem(env, |gles, mem| {
+        let equation = mem.ptr_at(equation, 4 /* upper bound */);
+        unsafe { gles.ClipPlanef(plane, equation) }
+    })
+}
+fn glClipPlanex(env: &mut Environment, plane: GLenum, equation: ConstPtr<GLfixed>) {
+    with_ctx_and_mem(env, |gles, mem| {
+        let equation = mem.ptr_at(equation, 4 /* upper bound */);
+        unsafe { gles.ClipPlanex(plane, equation) }
     })
 }
 fn glCullFace(env: &mut Environment, mode: GLenum) {
@@ -247,6 +328,19 @@ fn glLineWidth(env: &mut Environment, val: GLfloat) {
 }
 fn glLineWidthx(env: &mut Environment, val: GLfixed) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.LineWidthx(val) })
+}
+fn glStencilFunc(env: &mut Environment, func: GLenum, ref_: GLint, mask: GLuint) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.StencilFunc(func, ref_, mask)
+    });
+}
+fn glStencilOp(env: &mut Environment, sfail: GLenum, dpfail: GLenum, dppass: GLenum) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.StencilOp(sfail, dpfail, dppass)
+    });
+}
+fn glStencilMask(env: &mut Environment, mask: GLuint) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.StencilMask(mask) });
 }
 // Points
 fn glPointSize(env: &mut Environment, size: GLfloat) {
@@ -322,10 +416,19 @@ fn glLightxv(env: &mut Environment, light: GLenum, pname: GLenum, params: ConstP
 fn glLightModelf(env: &mut Environment, pname: GLenum, param: GLfloat) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.LightModelf(pname, param) })
 }
+fn glLightModelx(env: &mut Environment, pname: GLenum, param: GLfixed) {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.LightModelx(pname, param) })
+}
 fn glLightModelfv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLfloat>) {
     with_ctx_and_mem(env, |gles, mem| {
         let params = mem.ptr_at(params, 4 /* upper bound */);
         unsafe { gles.LightModelfv(pname, params) }
+    })
+}
+fn glLightModelxv(env: &mut Environment, pname: GLenum, params: ConstPtr<GLfixed>) {
+    with_ctx_and_mem(env, |gles, mem| {
+        let params = mem.ptr_at(params, 4 /* upper bound */);
+        unsafe { gles.LightModelxv(pname, params) }
     })
 }
 fn glMaterialf(env: &mut Environment, face: GLenum, pname: GLenum, param: GLfloat) {
@@ -351,7 +454,10 @@ fn glMaterialxv(env: &mut Environment, face: GLenum, pname: GLenum, params: Cons
     })
 }
 
-// Textures
+// Buffers
+fn glIsBuffer(env: &mut Environment, buffer: GLuint) -> GLboolean {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsBuffer(buffer) })
+}
 fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
@@ -430,9 +536,14 @@ fn glNormal3x(env: &mut Environment, nx: GLfixed, ny: GLfixed, nz: GLfixed) {
 
 // Pointers
 
-/// One of the ugliest things in OpenGL is that, depending on dynamic state, the
-/// pointer parameter of certain functions is either a pointer or an offset!
-unsafe fn translate_pointer_or_offset(
+/// Helper for implementing OpenGL pointer setting functions.
+///
+/// One of the ugliest things in OpenGL is that, depending on dynamic state
+/// (`ARRAY_BUFFER_BINDING` or `ELEMENT_ARRAY_BUFFER_BINDING`), the pointer
+/// parameter of certain functions is either a pointer or an offset!
+///
+/// See also: [translate_pointer_or_offset_to_guest]
+unsafe fn translate_pointer_or_offset_to_host(
     gles: &mut dyn GLES,
     mem: &Mem,
     pointer_or_offset: ConstVoidPtr,
@@ -447,8 +558,38 @@ unsafe fn translate_pointer_or_offset(
         std::ptr::null()
     } else {
         let pointer = pointer_or_offset;
-        // bounds checking is hopeless here
-        mem.ptr_at(pointer.cast::<u8>(), 0).cast::<GLvoid>()
+        // We need to use an unchecked version of ptr_at to avoid crashing here
+        // if dynamic state was disabled.
+        // Also, bounds checking is hopeless here
+        mem.unchecked_ptr_at(pointer.cast::<u8>(), 0)
+            .cast::<GLvoid>()
+    }
+}
+
+/// Helper for implementing OpenGL pointer retrieval.
+///
+/// Reverse of [translate_pointer_or_offset_to_host]. Depending on the value
+/// of `VERTEX_ARRAY_BUFFER_BINDING`/`NORMAL_ARRAY_BUFFER_BINDING`/etc
+/// (not to be confused with `ARRAY_BUFFER_BINDING`, only used when *setting*),
+/// the pointer retrieved with `glGetPointerv` may actually be an offset.
+///
+/// See also: [translate_pointer_or_offset_to_host]
+unsafe fn translate_pointer_or_offset_to_guest(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    pointer_or_offset: *const GLvoid,
+    which_binding: GLenum,
+) -> ConstVoidPtr {
+    let mut buffer_binding = 0;
+    gles.GetIntegerv(which_binding, &mut buffer_binding);
+    if buffer_binding != 0 {
+        let offset = pointer_or_offset as usize;
+        Ptr::from_bits(u32::try_from(offset).unwrap())
+    } else if pointer_or_offset.is_null() {
+        Ptr::null()
+    } else {
+        let pointer = pointer_or_offset;
+        mem.host_ptr_to_guest_ptr(pointer)
     }
 }
 
@@ -460,13 +601,15 @@ fn glColorPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer = translate_pointer_or_offset(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        let pointer =
+            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
         gles.ColorPointer(size, type_, stride, pointer)
     })
 }
 fn glNormalPointer(env: &mut Environment, type_: GLenum, stride: GLsizei, pointer: ConstVoidPtr) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer = translate_pointer_or_offset(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        let pointer =
+            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
         gles.NormalPointer(type_, stride, pointer)
     })
 }
@@ -478,7 +621,8 @@ fn glTexCoordPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer = translate_pointer_or_offset(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        let pointer =
+            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
         gles.TexCoordPointer(size, type_, stride, pointer)
     })
 }
@@ -490,7 +634,8 @@ fn glVertexPointer(
     pointer: ConstVoidPtr,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let pointer = translate_pointer_or_offset(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
+        let pointer =
+            translate_pointer_or_offset_to_host(gles, mem, pointer, gles11::ARRAY_BUFFER_BINDING);
         gles.VertexPointer(size, type_, stride, pointer)
     })
 }
@@ -498,7 +643,9 @@ fn glVertexPointer(
 // Drawing
 fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsizei) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.DrawArrays(mode, first, count)
+        let fog_state_backup = clamp_fog_state_values(gles);
+        gles.DrawArrays(mode, first, count);
+        restore_fog_state_values(gles, fog_state_backup);
     })
 }
 fn glDrawElements(
@@ -509,9 +656,15 @@ fn glDrawElements(
     indices: ConstVoidPtr,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
-        let indices =
-            translate_pointer_or_offset(gles, mem, indices, gles11::ELEMENT_ARRAY_BUFFER_BINDING);
-        gles.DrawElements(mode, count, type_, indices)
+        let fog_state_backup = clamp_fog_state_values(gles);
+        let indices = translate_pointer_or_offset_to_host(
+            gles,
+            mem,
+            indices,
+            gles11::ELEMENT_ARRAY_BUFFER_BINDING,
+        );
+        gles.DrawElements(mode, count, type_, indices);
+        restore_fog_state_values(gles, fog_state_backup);
     })
 }
 
@@ -699,6 +852,9 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
 }
 fn glActiveTexture(env: &mut Environment, texture: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.ActiveTexture(texture) })
+}
+fn glIsTexture(env: &mut Environment, texture: GLuint) -> GLboolean {
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.IsTexture(texture) })
 }
 fn glBindTexture(env: &mut Environment, target: GLenum, texture: GLuint) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
@@ -1004,6 +1160,18 @@ fn glFramebufferTexture2DOES(
         gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
     })
 }
+fn glGetFramebufferAttachmentParameterivOES(
+    env: &mut Environment,
+    target: GLenum,
+    attachment: GLenum,
+    pname: GLenum,
+    params: MutPtr<GLint>,
+) {
+    with_ctx_and_mem(env, |gles, mem| {
+        let params = mem.ptr_at_mut(params, 1);
+        unsafe { gles.GetFramebufferAttachmentParameterivOES(target, attachment, pname, params) }
+    })
+}
 fn glGetRenderbufferParameterivOES(
     env: &mut Environment,
     target: GLenum,
@@ -1044,6 +1212,129 @@ fn glGenerateMipmapOES(env: &mut Environment, target: GLenum) {
     with_ctx_and_mem(env, |gles, _mem| unsafe { gles.GenerateMipmapOES(target) })
 }
 
+fn glGetBufferParameteriv(
+    env: &mut Environment,
+    target: GLenum,
+    pname: GLenum,
+    params: MutPtr<GLint>,
+) {
+    let params = env.mem.ptr_at_mut(params, 1);
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.GetBufferParameteriv(target, pname, params)
+    })
+}
+fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutPtr<GLvoid> {
+    //  "glMapBuffer maps to the client's address space the entire data store
+    //  of the buffer object currently bound to target. The data can then be
+    //  directly read and/or written relative to the returned pointer,
+    //  depending on the specified access policy."
+    // https://docs.gl/gl2/glMapBuffer
+    //
+    // We have to make an address space in the guest and "forward" those
+    // reads/writes to the address space in the host, which is mapped to the
+    // target buffer.
+    // Since the mapped buffer can't be used until it's unmapped, we defer the
+    // "forwarding" of read/writes until the moment the buffer is unmapped.
+    assert!(matches!(target, ARRAY_BUFFER | ELEMENT_ARRAY_BUFFER));
+    assert!(access == WRITE_ONLY_OES);
+    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
+    let host_buffer = with_ctx_and_mem(env, |gles, _mem| unsafe {
+        gles.MapBufferOES(target, access)
+    });
+    if host_buffer.is_null() {
+        nil.cast()
+    } else {
+        let buffer_size = _get_buffer_size(env, target) as u32;
+        let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size).cast();
+        // Copy host buffer to guest buffer
+        unsafe {
+            env.mem
+                .bytes_at_mut(guest_buffer.cast(), buffer_size)
+                .copy_from_slice(from_raw_parts(host_buffer as *mut u8, buffer_size as usize));
+        }
+
+        let current_ctx = env
+            .framework_state
+            .opengles
+            .current_ctx_for_thread(env.current_thread);
+        let current_ctx_host_object = env
+            .objc
+            .borrow_mut::<EAGLContextHostObject>(current_ctx.unwrap());
+        assert!(current_ctx_host_object
+            .mapped_buffers
+            .insert(buffer_object_name, (guest_buffer, host_buffer))
+            .is_none());
+
+        guest_buffer
+    }
+}
+fn glUnmapBufferOES(env: &mut Environment, target: GLenum) -> GLboolean {
+    //  "A mapped data store must be unmapped with glUnmapBuffer before its
+    //  buffer object is used. Otherwise an error will be generated by any GL
+    //  command that attempts to dereference the buffer object's data store.
+    //  When a data store is unmapped, the pointer to its data store becomes
+    //  invalid."
+    // https://docs.gl/gl2/glMapBuffer
+    //
+    // Since the mapped buffer can't be used until it's unmapped, we defer the
+    // "forwarding" of read/writes until the moment the buffer is unmapped.
+    // The guest buffer is deallocated here
+    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
+
+    let current_ctx = env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread);
+    let current_ctx_host_object = env
+        .objc
+        .borrow_mut::<EAGLContextHostObject>(current_ctx.unwrap());
+
+    if let Some((guest_buffer, host_buffer)) = current_ctx_host_object
+        .mapped_buffers
+        .remove(&buffer_object_name)
+    {
+        let buffer_size = _get_buffer_size(env, target) as u32;
+        // Copy guest buffer to host buffer
+        unsafe {
+            host_buffer.copy_from(
+                env.mem.bytes_at(guest_buffer.cast(), buffer_size).as_ptr() as *mut GLvoid,
+                buffer_size as usize,
+            );
+        }
+        env.mem.free(guest_buffer);
+    }
+    with_ctx_and_mem(env, |gles, _mem| unsafe { gles.UnmapBufferOES(target) })
+}
+
+/// If fog is enabled, check if the values for start and end distances
+/// are equal. Apple platforms (even modern Mac OS) seem to handle that
+/// gracefully, however, both Windows and Android have issues in those cases.
+/// This workaround is required so Doom 2 RPG renders correctly.
+/// It prevents divisions by zero in levels where fog is used and both
+/// values are set to 10000.
+unsafe fn clamp_fog_state_values(gles: &mut dyn GLES) -> Option<(f32, f32)> {
+    let mut fogEnabled: GLboolean = 0;
+    gles.GetBooleanv(gles11::FOG, &mut fogEnabled);
+    if fogEnabled != 0 {
+        let mut fogStart: GLfloat = 0.0;
+        let mut fogEnd: GLfloat = 0.0;
+        gles.GetFloatv(gles11::FOG_START, &mut fogStart);
+        gles.GetFloatv(gles11::FOG_END, &mut fogEnd);
+        if fogStart == fogEnd {
+            let newFogStart = fogEnd - 0.001;
+            gles.Fogf(gles11::FOG_START, newFogStart);
+            return Some((fogStart, fogEnd));
+        }
+    }
+    None
+}
+unsafe fn restore_fog_state_values(gles: &mut dyn GLES, from_backup: Option<(f32, f32)>) {
+    if let Some((fogStart, fogEnd)) = from_backup {
+        gles.Fogf(gles11::FOG_START, fogStart);
+        gles.Fogf(gles11::FOG_END, fogEnd);
+    }
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     // Generic state manipulation
     export_c_func!(glGetError()),
@@ -1056,15 +1347,21 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glGetBooleanv(_, _)),
     export_c_func!(glGetFloatv(_, _)),
     export_c_func!(glGetIntegerv(_, _)),
+    export_c_func!(glGetPointerv(_, _)),
     export_c_func!(glGetTexEnviv(_, _, _)),
+    export_c_func!(glGetTexEnvfv(_, _, _)),
     export_c_func!(glHint(_, _)),
+    export_c_func!(glFinish()),
     export_c_func!(glFlush()),
     export_c_func!(glGetString(_)),
     // Other state manipulation
     export_c_func!(glAlphaFunc(_, _)),
     export_c_func!(glAlphaFuncx(_, _)),
     export_c_func!(glBlendFunc(_, _)),
+    export_c_func!(glBlendEquationOES(_)),
     export_c_func!(glColorMask(_, _, _, _)),
+    export_c_func!(glClipPlanef(_, _)),
+    export_c_func!(glClipPlanex(_, _)),
     export_c_func!(glCullFace(_)),
     export_c_func!(glDepthFunc(_)),
     export_c_func!(glDepthMask(_)),
@@ -1078,6 +1375,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glViewport(_, _, _, _)),
     export_c_func!(glLineWidth(_)),
     export_c_func!(glLineWidthx(_)),
+    export_c_func!(glStencilFunc(_, _, _)),
+    export_c_func!(glStencilOp(_, _, _)),
+    export_c_func!(glStencilMask(_)),
     // Points
     export_c_func!(glPointSize(_)),
     export_c_func!(glPointSizex(_)),
@@ -1096,11 +1396,14 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glLightxv(_, _, _)),
     export_c_func!(glLightModelf(_, _)),
     export_c_func!(glLightModelfv(_, _)),
+    export_c_func!(glLightModelx(_, _)),
+    export_c_func!(glLightModelxv(_, _)),
     export_c_func!(glMaterialf(_, _, _)),
     export_c_func!(glMaterialx(_, _, _)),
     export_c_func!(glMaterialfv(_, _, _)),
     export_c_func!(glMaterialxv(_, _, _)),
     // Buffers
+    export_c_func!(glIsBuffer(_)),
     export_c_func!(glGenBuffers(_, _)),
     export_c_func!(glDeleteBuffers(_, _)),
     export_c_func!(glBindBuffer(_, _)),
@@ -1151,6 +1454,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glGenTextures(_, _)),
     export_c_func!(glDeleteTextures(_, _)),
     export_c_func!(glActiveTexture(_)),
+    export_c_func!(glIsTexture(_)),
     export_c_func!(glBindTexture(_, _)),
     export_c_func!(glTexParameteri(_, _, _)),
     export_c_func!(glTexParameterf(_, _, _)),
@@ -1177,9 +1481,34 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glRenderbufferStorageOES(_, _, _, _)),
     export_c_func!(glFramebufferRenderbufferOES(_, _, _, _)),
     export_c_func!(glFramebufferTexture2DOES(_, _, _, _, _)),
+    export_c_func!(glGetFramebufferAttachmentParameterivOES(_, _, _, _)),
     export_c_func!(glGetRenderbufferParameterivOES(_, _, _)),
     export_c_func!(glCheckFramebufferStatusOES(_)),
     export_c_func!(glDeleteFramebuffersOES(_, _)),
     export_c_func!(glDeleteRenderbuffersOES(_, _)),
     export_c_func!(glGenerateMipmapOES(_)),
+    export_c_func!(glGetBufferParameteriv(_, _, _)),
+    export_c_func!(glMapBufferOES(_, _)),
+    export_c_func!(glUnmapBufferOES(_)),
 ];
+
+fn _get_currently_bound_buffer_object_name(env: &mut Environment, target: GLenum) -> GLuint {
+    with_ctx_and_mem(env, |gles, _mem| unsafe {
+        let pname = match target {
+            ARRAY_BUFFER => VERTEX_ARRAY_BUFFER_BINDING,
+            ELEMENT_ARRAY_BUFFER => ELEMENT_ARRAY_BUFFER_BINDING,
+            _ => panic!(),
+        };
+        let currently_bound_buffer_name: GLuint = 0;
+        gles.GetIntegerv(pname, &mut (currently_bound_buffer_name as GLint));
+        currently_bound_buffer_name
+    })
+}
+
+fn _get_buffer_size(env: &mut Environment, target: GLenum) -> GLint {
+    with_ctx_and_mem(env, |gles, _mem| {
+        let mut buffer_size: GLint = 0;
+        unsafe { gles.GetBufferParameteriv(target, gles11::BUFFER_SIZE, &mut buffer_size) }
+        buffer_size
+    })
+}

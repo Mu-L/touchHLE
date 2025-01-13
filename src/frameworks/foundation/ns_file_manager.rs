@@ -6,9 +6,10 @@
 //! `NSFileManager` etc.
 
 use super::{ns_array, ns_string, NSUInteger};
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
+use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::fs::{GuestPath, GuestPathBuf};
-use crate::mem::MutPtr;
+use crate::mem::{ConstPtr, MutPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject,
 };
@@ -16,10 +17,22 @@ use crate::Environment;
 
 type NSSearchPathDirectory = NSUInteger;
 const NSApplicationDirectory: NSSearchPathDirectory = 1;
+const NSLibraryDirectory: NSSearchPathDirectory = 5;
 const NSDocumentDirectory: NSSearchPathDirectory = 9;
 
 type NSSearchPathDomainMask = NSUInteger;
 const NSUserDomainMask: NSSearchPathDomainMask = 1;
+
+const NSFileModificationDate: &str = "NSFileModificationDate";
+const NSFileSize: &str = "NSFileSize";
+
+pub const CONSTANTS: ConstantExports = &[
+    (
+        "_NSFileModificationDate",
+        HostConstant::NSString(NSFileModificationDate),
+    ),
+    ("_NSFileSize", HostConstant::NSString(NSFileSize)),
+];
 
 fn NSSearchPathForDirectoriesInDomains(
     env: &mut Environment,
@@ -32,11 +45,15 @@ fn NSSearchPathForDirectoriesInDomains(
     assert!(expand_tilde);
 
     let dir = match directory {
-        // This might not actually be correct. I haven't bothered to test it
-        // because I can't think of a good reason an iPhone OS app would have to
-        // request this; Wolfenstein 3D requests it but never uses it.
-        NSApplicationDirectory => GuestPath::new(crate::fs::APPLICATIONS).to_owned(),
+        NSApplicationDirectory => {
+            // This might not actually be correct. I haven't bothered to
+            // test it because I can't think of a good reason an iPhone OS app
+            // would have to request this;
+            // Wolfenstein 3D requests it but never uses it.
+            GuestPath::new(crate::fs::APPLICATIONS).to_owned()
+        }
         NSDocumentDirectory => env.fs.home_directory().join("Documents"),
+        NSLibraryDirectory => env.fs.home_directory().join("Library"),
         _ => todo!("NSSearchPathDirectory {}", directory),
     };
     let dir = ns_string::from_rust_string(env, String::from(dir));
@@ -50,8 +67,17 @@ fn NSHomeDirectory(env: &mut Environment) -> id {
     autorelease(env, dir)
 }
 
+/// Check [crate::fs::Fs::new] for more info for
+/// how temporary folder is setup on startup
+fn NSTemporaryDirectory(env: &mut Environment) -> id {
+    let dir = env.fs.home_directory().join("tmp");
+    let dir = ns_string::from_rust_string(env, String::from(dir.as_str()));
+    autorelease(env, dir)
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(NSHomeDirectory()),
+    export_c_func!(NSTemporaryDirectory()),
     export_c_func!(NSSearchPathForDirectoriesInDomains(_, _, _)),
 ];
 
@@ -81,28 +107,48 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
-- (bool)fileExistsAtPath:(id)path { // NSString*
+- (id)currentDirectoryPath {
+    ns_string::from_rust_string(env, env.fs.working_directory().as_str().to_string())
+}
+
+- (bool)changeCurrentDirectoryPath:(id)path {
     let path = ns_string::to_rust_string(env, path); // TODO: avoid copy
-    // fileExistsAtPath: will return true for directories, hence Fs::exists()
-    // rather than Fs::is_file() is appropriate.
-    let res = env.fs.exists(GuestPath::new(&path));
-    log_dbg!("fileExistsAtPath:{:?} => {}", path, res);
-    res
+    let path = GuestPath::new(&path);
+    match env.fs.change_working_directory(path) {
+        Ok(_) => true,
+        Err(()) => false
+    }
+}
+
+- (bool)fileExistsAtPath:(id)path { // NSString*
+    let res_exists = if path == nil {
+        false
+    } else {
+        let path = ns_string::to_rust_string(env, path); // TODO: avoid copy
+        // fileExistsAtPath: will return true for directories
+        // hence Fs::exists() rather than Fs::is_file() is appropriate.
+        env.fs.exists(GuestPath::new(&path))
+    };
+    log_dbg!("[(NSFileManager*) {:?} fileExistsAtPath:{:?}] => {}", this, path, res_exists);
+    res_exists
 }
 
 - (bool)fileExistsAtPath:(id)path // NSString*
              isDirectory:(MutPtr<bool>)is_dir {
-    // TODO: mutualize with fileExistsAtPath:
-    let path = ns_string::to_rust_string(env, path); // TODO: avoid copy
-    let guest_path = GuestPath::new(&path);
-    let res_exists = env.fs.exists(guest_path);
-    if !is_dir.is_null() {
-        let res_is_dir = !env.fs.is_file(guest_path);
-        env.mem.write(is_dir, res_is_dir);
-        log_dbg!("fileExistsAtPath:{:?} isDirectory:{:?} => {}", path, res_is_dir, res_exists);
+    let (res_exists, res_is_dir) = if path == nil {
+        (false, false)
     } else {
-        log_dbg!("fileExistsAtPath:{:?} isDirectory:NULL => {}", path, res_exists);
+        // TODO: mutualize with fileExistsAtPath:
+        let path = ns_string::to_rust_string(env, path); // TODO: avoid copy
+        let guest_path = GuestPath::new(&path);
+        (env.fs.exists(guest_path), !env.fs.is_file(guest_path))
+    };
+
+    if !is_dir.is_null() {
+        env.mem.write(is_dir, res_is_dir);
     }
+
+    log_dbg!("[(NSFileManager*) {:?} fileExistsAtPath:{:?} isDirectory:{:?}] => {}", this, path, res_is_dir, res_exists);
     res_exists
 }
 
@@ -137,6 +183,44 @@ pub const CLASSES: ClassExports = objc_classes! {
             if !error.is_null() {
                 todo!(); // TODO: create an NSError if requested
             }
+            false
+        }
+    }
+}
+
+- (bool)createDirectoryAtPath:(id)path // NSString *
+                   attributes:(id)attributes { // NSDictionary*
+    let error: MutPtr<id> = Ptr::null();
+    msg![env; this createDirectoryAtPath:path
+             withIntermediateDirectories:false
+                              attributes:attributes
+                                   error:error]
+}
+
+- (bool)createDirectoryAtPath:(id)path // NSString *
+  withIntermediateDirectories:(bool)with_intermediates
+                   attributes:(id)attributes // NSDictionary*
+                        error:(MutPtr<id>)error { // NSError**
+    assert_eq!(attributes, nil); // TODO
+    assert!(error.is_null());
+
+    let path_str = ns_string::to_rust_string(env, path); // TODO: avoid copy
+    let res = if with_intermediates {
+        env.fs.create_dir_all(GuestPath::new(&path_str))
+    } else {
+        env.fs.create_dir(GuestPath::new(&path_str))
+    };
+    match res {
+        Ok(()) => {
+            log_dbg!("createDirectoryAtPath {} => true", path_str);
+            true
+        }
+        Err(err) => {
+            log!(
+                "Warning: createDirectoryAtPath {} failed with {:?}, returning false",
+                path_str,
+                err,
+            );
             false
         }
     }
@@ -181,6 +265,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     contents
 }
 
+- (id)contentsAtPath:(id)path { // NSString *
+    // TODO: return nil if path is directory
+    // TODO: handle non-absolute paths?
+    assert!(msg![env; path isAbsolutePath]);
+    msg_class![env; NSData dataWithContentsOfFile:path]
+}
+
 - (bool)copyItemAtPath:(id)src // NSString*
                 toPath:(id)dst // NSString*
                  error:(MutPtr<id>)_error { // NSError**
@@ -194,6 +285,43 @@ pub const CLASSES: ClassExports = objc_classes! {
         todo!();
     }
     true
+}
+
+- (ConstPtr<u8>)fileSystemRepresentationWithPath:(id)path { // NSString*
+    let length: NSUInteger = msg![env; path length];
+    assert!(length > 0);
+    // TODO: throw an exception if conversion fails
+    msg![env; path UTF8String]
+}
+
+- (id)fileAttributesAtPath:(id)path // NSString *
+              traverseLink:(bool)traverse {
+    // TODO: other attributes
+    log!("Warning: NSFileManager fileAttributesAtPath:traverseLink: returns only NSFileModificationDate and NSFileSize attributes!");
+
+    let path = ns_string::to_rust_string(env, path); // TODO: avoid copy
+    // TODO: traverse link
+    log_dbg!("[(NSFileManager *){:?} fileAttributesAtPath:{} traverse:{}]", this, path, traverse);
+    let guest_path = GuestPath::new(&path);
+
+    let unix_timestamp: f64 = env.fs.modified(guest_path).unwrap() as f64;
+    let unix_ref_date: id = msg_class![env; NSDate dateWithTimeIntervalSince1970:0f64];
+    let unix_date: id = msg_class![env; NSDate dateWithTimeInterval:unix_timestamp sinceDate:unix_ref_date];
+
+    let size = env.fs.size(guest_path).unwrap();
+    let size_num: id = msg_class![env; NSNumber numberWithUnsignedLongLong:size];
+
+    let dict = msg_class![env; NSMutableDictionary new];
+
+    let modif_date_key = get_static_str(env, NSFileModificationDate);
+    () = msg![env; dict setObject:unix_date forKey:modif_date_key];
+
+    let size_key = get_static_str(env, NSFileSize);
+    () = msg![env; dict setObject:size_num forKey:size_key];
+
+    let dict_imm = msg![env; dict copy];
+    release(env, dict);
+    autorelease(env, dict_imm)
 }
 
 @end

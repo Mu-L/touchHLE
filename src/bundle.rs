@@ -79,7 +79,11 @@ impl Bundle {
     }
 
     pub fn bundle_localizations(&self) -> &[Value] {
-        self.plist["CFBundleLocalizations"].as_array().unwrap()
+        static EMPTY_VAL: Vec<Value> = Vec::new();
+        self.plist
+            .get("CFBundleLocalizations")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&EMPTY_VAL)
     }
 
     /// Canonical name for the bundle according to Info.plist
@@ -154,12 +158,9 @@ impl Bundle {
         Ok(image)
     }
 
-    pub fn main_nib_file_path(&self) -> Option<GuestPathBuf> {
-        self.plist.get("NSMainNibFile").map(|filename| {
-            let filename = filename.as_string().unwrap();
-            // FIXME: There main nib file might be localized and have multiple
-            // paths. This method should definitely be removed eventually.
-            self.path.join(format!("{}.nib", filename))
-        })
+    pub fn main_nib_filename(&self) -> Option<&str> {
+        self.plist
+            .get("NSMainNibFile")
+            .map(|v| v.as_string().unwrap())
     }
 }

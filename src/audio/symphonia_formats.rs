@@ -3,19 +3,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! Quick-and-dirty AAC-LC decoding.
+//! Quick-and-dirty decoding of miscellaneous formats (MP3, AAC) to linear PCM.
 //!
 //! This should be the only module in touchHLE that makes use of [symphonia].
-//! Only the LC profile and MPEG-4 container format are supported (see feature
-//! list in Cargo.toml).
+//! For AAC, Only the LC profile and MPEG-4 container format are supported (see
+//! feature list in Cargo.toml).
 
 use std::io::Cursor;
 use symphonia::core::audio::{RawSampleBuffer, SignalSpec};
-use symphonia::core::codecs::CODEC_TYPE_AAC;
+use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_MP3};
 use symphonia::core::io::MediaSourceStream;
 
-/// PCM data decoded from an AAC file.
-pub struct AacDecodedToPcm {
+/// PCM data decoded from an miscellaneous format file.
+pub struct SymphoniaDecodedToPcm {
     /// 16-bit little-endian PCM samples, grouped in frames (one sample per
     /// channel in each frame).
     pub bytes: Vec<u8>,
@@ -25,7 +25,7 @@ pub struct AacDecodedToPcm {
     pub channels: u32,
 }
 
-pub fn decode_aac_to_pcm(file: Cursor<Vec<u8>>) -> Result<AacDecodedToPcm, ()> {
+pub fn decode_symphonia_to_pcm(file: Cursor<Vec<u8>>) -> Result<SymphoniaDecodedToPcm, ()> {
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     // If this failed, the container format is not supported.
@@ -38,12 +38,12 @@ pub fn decode_aac_to_pcm(file: Cursor<Vec<u8>>) -> Result<AacDecodedToPcm, ()> {
         )
         .map_err(|_| ())?;
 
-    // If this failed, no AAC audio track was found.
+    // If this failed, no audio track with a relevant format was found.
     let mut format = probed.format;
     let track = format
         .tracks()
         .iter()
-        .find(|t| t.codec_params.codec == CODEC_TYPE_AAC)
+        .find(|t| t.codec_params.codec == CODEC_TYPE_AAC || t.codec_params.codec == CODEC_TYPE_MP3)
         .ok_or(())?;
     let track_id = track.id;
 
@@ -91,8 +91,7 @@ pub fn decode_aac_to_pcm(file: Cursor<Vec<u8>>) -> Result<AacDecodedToPcm, ()> {
         }
     }
     let signal_spec = signal_spec.ok_or(())?;
-
-    Ok(AacDecodedToPcm {
+    Ok(SymphoniaDecodedToPcm {
         bytes: out_pcm,
         sample_rate: signal_spec.rate,
         channels: signal_spec.channels.count().try_into().unwrap(),

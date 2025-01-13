@@ -31,6 +31,7 @@ pub use bundle::BundleData;
 use crate::fs::bundle::{IpaFile, IpaFileRef};
 use crate::paths;
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,14 @@ enum FileLocation {
     IpaFileRef(IpaFileRef),
     /// Name of a resource file bundled with touchHLE. Read only.
     ResourceFilePath(String),
+}
+
+#[derive(Debug)]
+pub enum FsError {
+    AlreadyExist,
+    InvalidParentDir,
+    NonexistentParentDir,
+    ReadonlyParentDir,
 }
 
 #[derive(Debug)]
@@ -262,7 +271,7 @@ fn apply_path_component<'a>(components: &mut Vec<&'a str>, component: &'a str) {
 /// `relative_to` is the starting point for resolving a relative path, e.g. the
 /// current directory. It must be an absolute path. It is optional if `path`
 /// is absolute.
-fn resolve_path<'a>(path: &'a GuestPath, relative_to: Option<&'a GuestPath>) -> Vec<&'a str> {
+pub fn resolve_path<'a>(path: &'a GuestPath, relative_to: Option<&'a GuestPath>) -> Vec<&'a str> {
     log_dbg!("Resolving {:?} relative to {:?}", path, relative_to);
 
     let mut components = Vec::new();
@@ -344,6 +353,7 @@ fn handle_open_err<T, E: std::fmt::Display, P: std::fmt::Debug>(
 /// Like [File] but for the guest filesystem.
 #[derive(Debug)]
 pub enum GuestFile {
+    Directory,
     File(File),
     IpaBundleFile(IpaFile),
     ResourceFile(paths::ResourceFile),
@@ -362,10 +372,15 @@ impl GuestFile {
         GuestFile::ResourceFile(file)
     }
 
+    fn from_directory() -> GuestFile {
+        GuestFile::Directory
+    }
+
     pub fn sync_all(&self) -> std::io::Result<()> {
         match self {
             GuestFile::File(file) => file.sync_all(),
             GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => Ok(()),
+            GuestFile::Directory => panic!("Attempt to sync a directory as a guest file"),
         }
     }
     pub fn set_len(&self, len: u64) -> std::io::Result<()> {
@@ -377,6 +392,7 @@ impl GuestFile {
             GuestFile::ResourceFile(file) => {
                 panic!("Attempt to resize a read-only file: {:?}", file)
             }
+            GuestFile::Directory => panic!("Attempt to resize a directory as a guest file"),
         }
     }
 }
@@ -387,6 +403,7 @@ impl Read for GuestFile {
             GuestFile::File(file) => file.read(buf),
             GuestFile::IpaBundleFile(file) => file.read(buf),
             GuestFile::ResourceFile(file) => file.get().read(buf),
+            GuestFile::Directory => panic!("Attempt to read from a directory as a guest file"),
         }
     }
 }
@@ -401,6 +418,7 @@ impl Write for GuestFile {
             GuestFile::ResourceFile(file) => {
                 panic!("Attempt to write to a read-only file: {:?}", file)
             }
+            GuestFile::Directory => panic!("Attempt to write to a directory as a guest file"),
         }
     }
 
@@ -413,6 +431,7 @@ impl Write for GuestFile {
             GuestFile::ResourceFile(file) => {
                 panic!("Attempt to flush a read-only file: {:?}", file)
             }
+            GuestFile::Directory => panic!("Attempt to flush a directory as a guest file"),
         }
     }
 }
@@ -423,6 +442,7 @@ impl Seek for GuestFile {
             GuestFile::File(file) => file.seek(pos),
             GuestFile::IpaBundleFile(file) => file.seek(pos),
             GuestFile::ResourceFile(file) => file.get().seek(pos),
+            GuestFile::Directory => panic!("Attempt to seek in a directory as a guest file"),
         }
     }
 }
@@ -467,21 +487,38 @@ impl Fs {
 
         let bundle_guest_path = home_directory.join(&bundle_dir_name);
 
-        let documents_host_path = if !read_only_mode {
-            let path = paths::user_data_base_path()
-                .join(paths::SANDBOX_DIR)
-                .join(bundle_id)
-                .join("Documents");
-            if let Err(e) = std::fs::create_dir_all(&path) {
-                panic!(
-                    "Could not create documents directory for app at {:?}: {:?}",
-                    path, e
-                );
+        let directories = ["Documents", "Library", "tmp"];
+        let host_path_directories = directories.map(|dir| {
+            if !read_only_mode {
+                let path = paths::user_data_base_path()
+                    .join(paths::SANDBOX_DIR)
+                    .join(bundle_id)
+                    .join(dir);
+                if dir == "tmp" {
+                    // We clean temporary directory for current app at startup.
+                    // This is no-op if directory doesn't exist.
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log_dbg!(
+                                "Unable to clean tmp host folder {:?} at startup: {}",
+                                path,
+                                e
+                            );
+                        }
+                    }
+                }
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    panic!(
+                        "Could not create documents directory for app at {:?}: {:?}",
+                        path, e
+                    );
+                }
+                Some(path)
+            } else {
+                None
             }
-            Some(path)
-        } else {
-            None
-        };
+        });
 
         // Some Free Software libraries are bundled with touchHLE.
         use paths::DYLIBS_DIR;
@@ -502,11 +539,13 @@ impl Fs {
 
         let mut app_dir_children = HashMap::new();
         app_dir_children.insert(bundle_dir_name, app_bundle.into_fs_node());
-        if let Some(documents_host_path) = documents_host_path {
-            app_dir_children.insert(
-                "Documents".to_string(),
-                FsNode::from_host_dir(&documents_host_path, /* writeable: */ true),
-            );
+        for (dir, host_path) in directories.iter().zip(host_path_directories.iter()) {
+            if let Some(host_path) = host_path {
+                app_dir_children.insert(
+                    dir.to_string(),
+                    FsNode::from_host_dir(host_path, /* writeable: */ true),
+                );
+            }
         }
 
         let root = FsNode::dir()
@@ -659,6 +698,41 @@ impl Fs {
         matches!(self.lookup_node(path), Some(FsNode::Directory { .. }))
     }
 
+    pub fn modified(&self, path: &GuestPath) -> Result<i64, ()> {
+        // TODO: error handling
+        let node = self.lookup_node(path).ok_or(())?;
+        match node {
+            FsNode::File { location, .. } => match location {
+                // Note: the returned time is consistent with 'Date' and 'Time'
+                // of files inside IPA archive as reported by 7-zip.
+                // But it can be few hours off in comparison with modification
+                // time reported by NSFileModificationDate for app bundle files
+                // and changes if system timezone changes and apps gets
+                // re-installed!
+                // This shouldn't be a big problem as we're always assuming
+                // GMT in the codebase right now.
+                // TODO: double check that when we support different timezones
+                FileLocation::IpaFileRef(ipa_file_ref) => {
+                    Ok(ipa_file_ref.get_last_modified().into())
+                }
+                _ => unimplemented!(),
+            },
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn size(&self, path: &GuestPath) -> Result<u64, ()> {
+        // TODO: error handling
+        let node = self.lookup_node(path).ok_or(())?;
+        match node {
+            FsNode::File { location, .. } => match location {
+                FileLocation::IpaFileRef(ipa_file_ref) => Ok(ipa_file_ref.get_size()),
+                _ => unimplemented!(),
+            },
+            _ => unimplemented!(),
+        }
+    }
+
     /// Get an iterator over the names of files/directories in a directory.
     pub fn enumerate<P: AsRef<GuestPath>>(
         &self,
@@ -745,6 +819,57 @@ impl Fs {
         }
     }
 
+    pub fn rename<P: AsRef<GuestPath> + Copy>(&mut self, from: P, to: P) -> Result<(), ()> {
+        let from_node = self.lookup_node(from.as_ref()).ok_or(())?;
+        let from_host_path = match from_node {
+            FsNode::File {
+                location: from_location,
+                writeable: from_writeable,
+            } => {
+                let FileLocation::Path(from_host_path) = from_location else {
+                    // TODO: return EISDIR
+                    return Err(());
+                };
+                assert!(from_writeable); // TODO: return errno
+                                         // TODO: avoid copy?
+                from_host_path.clone()
+            }
+            _ => unimplemented!(),
+        };
+
+        if self.lookup_node(to.as_ref()).is_none() {
+            // In case target guest node do not exist, we need to create one
+            let mut options = GuestOpenOptions::new();
+            options.write().create().truncate();
+            self.open_with_options(to, options)?;
+        }
+
+        let to_node = self.lookup_node(to.as_ref()).unwrap();
+        let FsNode::File {
+            location: to_location,
+            writeable: to_writeable,
+        } = to_node
+        else {
+            // TODO: return EISDIR
+            return Err(());
+        };
+        let FileLocation::Path(to_host_path) = to_location else {
+            // TODO: return EACCES
+            return Err(());
+        };
+        assert!(to_writeable); // TODO: return errno
+        let res = fs::rename(from_host_path, to_host_path);
+        if res.is_ok() {
+            // Remove reference to the old from node
+            let (parent_from, component) = self.lookup_parent_node(from.as_ref()).unwrap();
+            let FsNode::Directory { children, .. } = parent_from else {
+                panic!()
+            };
+            children.remove(&component).unwrap();
+        }
+        res.map_err(|_| ())
+    }
+
     /// Like [File::options] but for the guest filesystem.
     pub fn open_with_options<P: AsRef<GuestPath>>(
         &mut self,
@@ -810,7 +935,11 @@ impl Fs {
                     }
                 }
                 FsNode::Directory { .. } => {
-                    return Err(());
+                    if write {
+                        return Err(());
+                    } else {
+                        return Ok(GuestFile::from_directory());
+                    }
                 }
             }
         };
@@ -939,11 +1068,31 @@ impl Fs {
         Ok(())
     }
 
+    /// Like [std::fs::create_dir_all] but for the guest filesystem.
+    pub fn create_dir_all<P: AsRef<GuestPath>>(&mut self, path: P) -> Result<(), FsError> {
+        let path = path.as_ref();
+        assert!(path.as_str().starts_with('/'));
+        // TODO: use GuestPathBuf push() once implemented
+        let mut tmp_vec = vec![""];
+        let components = resolve_path(path, None);
+        for component in components {
+            tmp_vec.push(component);
+            let res = self.create_dir(GuestPathBuf::from(tmp_vec.join("/")));
+            match res {
+                Ok(_) | Err(FsError::AlreadyExist) => {}
+                _ => return res,
+            }
+        }
+        Ok(())
+    }
+
     /// Like [std::fs::create_dir] but for the guest filesystem.
-    pub fn create_dir<P: AsRef<GuestPath>>(&mut self, path: P) -> Result<(), ()> {
+    pub fn create_dir<P: AsRef<GuestPath>>(&mut self, path: P) -> Result<(), FsError> {
         let path = path.as_ref();
 
-        let (parent_node, new_dir_name) = self.lookup_parent_node(path).ok_or(())?;
+        let (parent_node, new_dir_name) = self
+            .lookup_parent_node(path)
+            .ok_or(FsError::NonexistentParentDir)?;
 
         // Parent directory is not a directory
         let FsNode::Directory {
@@ -951,17 +1100,17 @@ impl Fs {
             writeable: dir_host_path,
         } = parent_node
         else {
-            return Err(());
+            return Err(FsError::InvalidParentDir);
         };
 
         // There's already a file/directory with this name
         if children.contains_key(&new_dir_name) {
-            return Err(());
+            return Err(FsError::AlreadyExist);
         }
 
         let Some(dir_host_path) = dir_host_path else {
             log!("Warning: attempt to create directory at path {:?}, but parent directory is read-only", path);
-            return Err(());
+            return Err(FsError::ReadonlyParentDir);
         };
 
         for c in new_dir_name.chars() {

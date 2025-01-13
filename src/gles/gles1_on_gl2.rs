@@ -70,18 +70,23 @@ pub const CAPABILITIES: &[GLenum] = &[
     gl21::POINT_SPRITE,
 ];
 
+pub const UNSUPPORTED_CAPABILITIES: &[GLenum] = &[
+    0x8620, // GL_VERTEX_PROGRAM_NV
+    gl21::TEXTURE,
+];
+
 pub struct ArrayInfo {
     /// Enum used by `glEnableClientState`, `glDisableClientState` and
     /// `glGetBoolean`.
     pub name: GLenum,
     /// Buffer binding enum for `glGetInteger`.
-    buffer_binding: GLenum,
+    pub buffer_binding: GLenum,
     /// Size enum for `glGetInteger`.
     size: Option<GLenum>,
     /// Stride enum for `glGetInteger`.
     stride: GLenum,
     /// Pointer enum for `glGetPointer`.
-    pointer: GLenum,
+    pub pointer: GLenum,
 }
 
 struct ArrayStateBackup {
@@ -150,7 +155,6 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::COLOR_LOGIC_OP, ParamType::Boolean, 1),
     (gl21::COLOR_MATERIAL, ParamType::Boolean, 1),
     (gl21::COLOR_WRITEMASK, ParamType::Boolean, 4),
-    // TODO: COMPRESSED_TEXTURE_FORMATS (need to support PVRTC etc)
     (gl21::CULL_FACE, ParamType::Boolean, 1),
     (gl21::CULL_FACE_MODE, ParamType::Int, 1),
     (gl21::CURRENT_COLOR, ParamType::FloatSpecial, 4), // TODO correct type
@@ -209,7 +213,6 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::NORMAL_ARRAY_STRIDE, ParamType::Int, 1),
     (gl21::NORMAL_ARRAY_TYPE, ParamType::Int, 1),
     (gl21::NORMALIZE, ParamType::Boolean, 1),
-    // TODO: NUM_COMPRESSED_TEXTURE_FORMATS (need to support PVRTC etc)
     (gl21::PACK_ALIGNMENT, ParamType::Int, 1),
     (gl21::PERSPECTIVE_CORRECTION_HINT, ParamType::Int, 1),
     (gl21::POINT_DISTANCE_ATTENUATION, ParamType::Float, 3),
@@ -310,6 +313,11 @@ const LIGHT_PARAMS: ParamTable = ParamTable(&[
     (gl21::CONSTANT_ATTENUATION, ParamType::Float, 1),
     (gl21::LINEAR_ATTENUATION, ParamType::Float, 1),
     (gl21::QUADRATIC_ATTENUATION, ParamType::Float, 1),
+]);
+
+const LIGHT_MODEL_PARAMS: ParamTable = ParamTable(&[
+    (gl21::LIGHT_MODEL_AMBIENT, ParamType::Float, 4),
+    (gl21::LIGHT_MODEL_TWO_SIDE, ParamType::Boolean, 1),
 ]);
 
 /// Table of `glMaterial` parameters shared by OpenGL ES 1.1 and OpenGL 2.1.
@@ -416,7 +424,10 @@ impl GLES1OnGL2 {
 
             let mut buffer_binding = 0;
             gl21::GetIntegerv(array_info.buffer_binding, &mut buffer_binding);
-            // TODO: translation for bound array buffers
+            if buffer_binding != 0 {
+                // TODO: translation for bound array buffers
+                todo!("TODO: GLES1-on-GL2 layer does not support buffer bindings yet. (Try OpenGL ES on Android.)");
+            }
             assert!(buffer_binding == 0);
 
             // Get and back up data
@@ -541,36 +552,6 @@ impl GLES1OnGL2 {
             }
         }
     }
-
-    /// If fog is enabled, check if the values for start and end distances
-    /// are equal, or start distance is greater than end distance.
-    /// Apple platforms (even modern Mac OS) seem to handle that gracefully,
-    /// however, both Windows and Android have issues in those cases.
-    /// This workaround is required so Doom 2 RPG renders correctly.
-    /// It prevents divisions by zero in levels where fog is used and both
-    /// values are set to 10000.
-    unsafe fn clamp_fog_state_values(&mut self) -> Option<(f32, f32)> {
-        let mut fogEnabled: GLboolean = 0;
-        gl21::GetBooleanv(gl21::FOG, &mut fogEnabled);
-        if fogEnabled != 0 {
-            let mut fogStart: GLfloat = 0.0;
-            let mut fogEnd: GLfloat = 0.0;
-            gl21::GetFloatv(gl21::FOG_START, &mut fogStart);
-            gl21::GetFloatv(gl21::FOG_END, &mut fogEnd);
-            if fogStart == fogEnd {
-                let newFogStart = fogEnd - 0.001;
-                gl21::Fogf(gl21::FOG_START, newFogStart);
-                return Some((fogStart, fogEnd));
-            }
-        }
-        None
-    }
-    unsafe fn restore_fog_state_values(&mut self, from_backup: Option<(f32, f32)>) {
-        if let Some((fogStart, fogEnd)) = from_backup {
-            gl21::Fogf(gl21::FOG_START, fogStart);
-            gl21::Fogf(gl21::FOG_END, fogEnd);
-        }
-    }
 }
 impl GLES for GLES1OnGL2 {
     fn description() -> &'static str {
@@ -611,20 +592,33 @@ impl GLES for GLES1OnGL2 {
     unsafe fn Enable(&mut self, cap: GLenum) {
         if ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == cap) {
             log_dbg!("Tolerating glEnable({:#x}) of client state", cap);
+        } else if cap == gl21::PERSPECTIVE_CORRECTION_HINT
+            || cap == gl21::SMOOTH
+            || cap == gl21::BLEND_EQUATION
+        {
+            log_dbg!("Tolerating glEnable({:#x})", cap);
         } else {
             assert!(CAPABILITIES.contains(&cap));
         }
         gl21::Enable(cap);
     }
     unsafe fn IsEnabled(&mut self, cap: GLenum) -> GLboolean {
-        assert!(CAPABILITIES.contains(&cap));
+        assert!(
+            CAPABILITIES.contains(&cap) || ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == cap)
+        );
         gl21::IsEnabled(cap)
     }
     unsafe fn Disable(&mut self, cap: GLenum) {
         if ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == cap) {
             log_dbg!("Tolerating glDisable({:#x}) of client state", cap);
+        } else if UNSUPPORTED_CAPABILITIES.contains(&cap) {
+            log_dbg!("Tolerating glDisable({:#x}) of unsupported capability", cap);
         } else {
-            assert!(CAPABILITIES.contains(&cap));
+            assert!(
+                CAPABILITIES.contains(&cap),
+                "Unexpected glDisable({:#x})",
+                cap
+            );
         }
         gl21::Disable(cap);
     }
@@ -632,11 +626,25 @@ impl GLES for GLES1OnGL2 {
         gl21::ClientActiveTexture(texture);
     }
     unsafe fn EnableClientState(&mut self, array: GLenum) {
-        assert!(ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == array));
+        if CAPABILITIES.contains(&array) {
+            log_dbg!(
+                "Tolerating glEnableClientState({:#x}) of a capability",
+                array
+            );
+        } else {
+            assert!(ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == array));
+        }
         gl21::EnableClientState(array);
     }
     unsafe fn DisableClientState(&mut self, array: GLenum) {
-        assert!(ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == array));
+        if CAPABILITIES.contains(&array) {
+            log_dbg!(
+                "Tolerating glDisableClientState({:#x}) of a capability",
+                array
+            );
+        } else {
+            assert!(ARRAYS.iter().any(|&ArrayInfo { name, .. }| name == array));
+        }
         gl21::DisableClientState(array);
     }
     unsafe fn GetBooleanv(&mut self, pname: GLenum, params: *mut GLboolean) {
@@ -664,6 +672,12 @@ impl GLES for GLES1OnGL2 {
         assert_eq!(target, gl21::TEXTURE_ENV);
         gl21::GetTexEnviv(target, pname, params);
     }
+    unsafe fn GetTexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
+        let (type_, _count) = TEX_ENV_PARAMS.get_type_info(pname);
+        assert!(type_ == ParamType::Float);
+        assert_eq!(target, gl21::TEXTURE_ENV);
+        gl21::GetTexEnvfv(target, pname, params);
+    }
     unsafe fn GetPointerv(&mut self, pname: GLenum, params: *mut *const GLvoid) {
         assert!(ARRAYS
             .iter()
@@ -684,6 +698,9 @@ impl GLES for GLES1OnGL2 {
         .contains(&target));
         assert!([gl21::FASTEST, gl21::NICEST, gl21::DONT_CARE].contains(&mode));
         gl21::Hint(target, mode);
+    }
+    unsafe fn Finish(&mut self) {
+        gl21::Finish();
     }
     unsafe fn Flush(&mut self) {
         gl21::Flush();
@@ -743,6 +760,15 @@ impl GLES for GLES1OnGL2 {
         }
         gl21::BlendFunc(sfactor, dfactor);
     }
+    unsafe fn BlendEquationOES(&mut self, mode: GLenum) {
+        let functions = [
+            gl21::FUNC_ADD,
+            gl21::FUNC_SUBTRACT,
+            gl21::FUNC_REVERSE_SUBTRACT,
+        ];
+        assert!(functions.contains(&mode));
+        gl21::BlendEquation(mode);
+    }
     unsafe fn ColorMask(
         &mut self,
         red: GLboolean,
@@ -751,6 +777,48 @@ impl GLES for GLES1OnGL2 {
         alpha: GLboolean,
     ) {
         gl21::ColorMask(red, green, blue, alpha)
+    }
+    unsafe fn ClipPlanef(&mut self, plane: GLenum, equation: *const GLfloat) {
+        let mut max_planes = 0;
+        gl21::GetIntegerv(gl21::MAX_CLIP_PLANES, &mut max_planes);
+        assert!(max_planes <= 6);
+        let planes = [
+            gl21::CLIP_PLANE0,
+            gl21::CLIP_PLANE1,
+            gl21::CLIP_PLANE2,
+            gl21::CLIP_PLANE3,
+            gl21::CLIP_PLANE4,
+            gl21::CLIP_PLANE5,
+        ];
+        assert!(planes.contains(&plane));
+
+        let mut equation_double: [GLdouble; 4] = [0.0; 4];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..4 {
+            equation_double[i] = *equation.wrapping_add(i) as GLdouble;
+        }
+        gl21::ClipPlane(plane, &equation_double as _)
+    }
+    unsafe fn ClipPlanex(&mut self, plane: GLenum, equation: *const GLfixed) {
+        let mut max_planes = 0;
+        gl21::GetIntegerv(gl21::MAX_CLIP_PLANES, &mut max_planes);
+        assert!(max_planes <= 6);
+        let planes = [
+            gl21::CLIP_PLANE0,
+            gl21::CLIP_PLANE1,
+            gl21::CLIP_PLANE2,
+            gl21::CLIP_PLANE3,
+            gl21::CLIP_PLANE4,
+            gl21::CLIP_PLANE5,
+        ];
+        assert!(planes.contains(&plane));
+
+        let mut equation_double: [GLdouble; 4] = [0.0; 4];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..4 {
+            equation_double[i] = fixed_to_float(*equation.wrapping_add(i)) as GLdouble;
+        }
+        gl21::ClipPlane(plane, &equation_double as _)
     }
     unsafe fn CullFace(&mut self, mode: GLenum) {
         assert!([gl21::FRONT, gl21::BACK, gl21::FRONT_AND_BACK].contains(&mode));
@@ -804,6 +872,37 @@ impl GLES for GLES1OnGL2 {
     }
     unsafe fn LineWidthx(&mut self, val: GLfixed) {
         gl21::LineWidth(fixed_to_float(val))
+    }
+    unsafe fn StencilFunc(&mut self, func: GLenum, ref_: GLint, mask: GLuint) {
+        assert!([
+            gl21::NEVER,
+            gl21::LESS,
+            gl21::EQUAL,
+            gl21::LEQUAL,
+            gl21::GREATER,
+            gl21::NOTEQUAL,
+            gl21::GEQUAL,
+            gl21::ALWAYS
+        ]
+        .contains(&func));
+        gl21::StencilFunc(func, ref_, mask);
+    }
+    unsafe fn StencilOp(&mut self, sfail: GLenum, dpfail: GLenum, dppass: GLenum) {
+        for enum_ in [sfail, dpfail, dppass].iter() {
+            assert!([
+                gl21::KEEP,
+                gl21::ZERO,
+                gl21::REPLACE,
+                gl21::INCR,
+                gl21::DECR,
+                gl21::INVERT,
+            ]
+            .contains(enum_));
+        }
+        gl21::StencilOp(sfail, dpfail, dppass);
+    }
+    unsafe fn StencilMask(&mut self, mask: GLuint) {
+        gl21::StencilMask(mask);
     }
 
     // Points
@@ -886,10 +985,28 @@ impl GLES for GLES1OnGL2 {
         )
     }
     unsafe fn LightModelf(&mut self, pname: GLenum, param: GLfloat) {
+        LIGHT_MODEL_PARAMS.assert_component_count(pname, 1);
         gl21::LightModelf(pname, param)
     }
+    unsafe fn LightModelx(&mut self, pname: GLenum, param: GLfixed) {
+        LIGHT_MODEL_PARAMS.setx(
+            |param| gl21::LightModelf(pname, param),
+            |param| gl21::LightModeli(pname, param),
+            pname,
+            param,
+        )
+    }
     unsafe fn LightModelfv(&mut self, pname: GLenum, params: *const GLfloat) {
+        LIGHT_MODEL_PARAMS.assert_known_param(pname);
         gl21::LightModelfv(pname, params)
+    }
+    unsafe fn LightModelxv(&mut self, pname: GLenum, params: *const GLfixed) {
+        LIGHT_MODEL_PARAMS.setxv(
+            |param| gl21::LightModelfv(pname, param),
+            |param| gl21::LightModeliv(pname, param),
+            pname,
+            params,
+        )
     }
     unsafe fn Materialf(&mut self, face: GLenum, pname: GLenum, param: GLfloat) {
         assert!(face == gl21::FRONT_AND_BACK);
@@ -906,6 +1023,15 @@ impl GLES for GLES1OnGL2 {
         )
     }
     unsafe fn Materialfv(&mut self, face: GLenum, pname: GLenum, params: *const GLfloat) {
+        if face == gl21::FRONT || face == gl21::BACK {
+            log!(
+                "App is calling glMaterialfv({:#x}, {:#x}, {:?}) with wrong face value, ignoring",
+                face,
+                pname,
+                params
+            );
+            return;
+        }
         assert!(face == gl21::FRONT_AND_BACK);
         MATERIAL_PARAMS.assert_known_param(pname);
         gl21::Materialfv(face, pname, params);
@@ -921,6 +1047,9 @@ impl GLES for GLES1OnGL2 {
     }
 
     // Buffers
+    unsafe fn IsBuffer(&mut self, buffer: GLuint) -> GLboolean {
+        gl21::IsBuffer(buffer)
+    }
     unsafe fn GenBuffers(&mut self, n: GLsizei, buffers: *mut GLuint) {
         gl21::GenBuffers(n, buffers)
     }
@@ -1067,12 +1196,10 @@ impl GLES for GLES1OnGL2 {
         ]
         .contains(&mode));
 
-        let fog_state_backup = self.clamp_fog_state_values();
         let fixed_point_arrays_state_backup = self.translate_fixed_point_arrays(first, count);
 
         gl21::DrawArrays(mode, first, count);
 
-        self.restore_fog_state_values(fog_state_backup);
         self.restore_fixed_point_arrays(fixed_point_arrays_state_backup);
     }
     unsafe fn DrawElements(
@@ -1094,63 +1221,66 @@ impl GLES for GLES1OnGL2 {
         .contains(&mode));
         assert!(type_ == gl21::UNSIGNED_BYTE || type_ == gl21::UNSIGNED_SHORT);
 
-        let fog_state_backup = self.clamp_fog_state_values();
-        let fixed_point_arrays_state_backup =
-            if self.pointer_is_fixed_point.iter().any(|&is_fixed| is_fixed) {
-                // Scan the index buffer to find the range of data that may need
-                // fixed-point translation.
-                // TODO: Would it be more efficient to turn this into a
-                // non-indexed draw-call instead?
+        let fixed_point_arrays_state_backup = if self
+            .pointer_is_fixed_point
+            .iter()
+            .any(|&is_fixed| is_fixed)
+        {
+            // Scan the index buffer to find the range of data that may need
+            // fixed-point translation.
+            // TODO: Would it be more efficient to turn this into a
+            // non-indexed draw-call instead?
 
-                let mut index_buffer_binding = 0;
-                gl21::GetIntegerv(
-                    gl21::ELEMENT_ARRAY_BUFFER_BINDING,
-                    &mut index_buffer_binding,
-                );
-                // TODO: handling of bound index array buffers
-                assert!(index_buffer_binding == 0);
+            let mut index_buffer_binding = 0;
+            gl21::GetIntegerv(
+                gl21::ELEMENT_ARRAY_BUFFER_BINDING,
+                &mut index_buffer_binding,
+            );
+            if index_buffer_binding != 0 {
+                // TODO: translation for bound index array buffers
+                todo!("TODO: GLES1-on-GL2 layer does not support buffer bindings yet. (Try OpenGL ES on Android.)");
+            }
 
-                let mut first = usize::MAX;
-                let mut last = usize::MIN;
-                assert!(count >= 0);
-                match type_ {
-                    gl21::UNSIGNED_BYTE => {
-                        let indices_ptr: *const GLubyte = indices.cast();
-                        for i in 0..(count as usize) {
-                            let index = indices_ptr.add(i).read_unaligned();
-                            first = first.min(index as usize);
-                            last = last.max(index as usize);
-                        }
+            let mut first = usize::MAX;
+            let mut last = usize::MIN;
+            assert!(count >= 0);
+            match type_ {
+                gl21::UNSIGNED_BYTE => {
+                    let indices_ptr: *const GLubyte = indices.cast();
+                    for i in 0..(count as usize) {
+                        let index = indices_ptr.add(i).read_unaligned();
+                        first = first.min(index as usize);
+                        last = last.max(index as usize);
                     }
-                    gl21::UNSIGNED_SHORT => {
-                        let indices_ptr: *const GLushort = indices.cast();
-                        for i in 0..(count as usize) {
-                            let index = indices_ptr.add(i).read_unaligned();
-                            first = first.min(index as usize);
-                            last = last.max(index as usize);
-                        }
-                    }
-                    _ => unreachable!(),
                 }
+                gl21::UNSIGNED_SHORT => {
+                    let indices_ptr: *const GLushort = indices.cast();
+                    for i in 0..(count as usize) {
+                        let index = indices_ptr.add(i).read_unaligned();
+                        first = first.min(index as usize);
+                        last = last.max(index as usize);
+                    }
+                }
+                _ => unreachable!(),
+            }
 
-                let (first, count) = if first == usize::MAX && last == usize::MIN {
-                    assert!(count == 0);
-                    (0, 0)
-                } else {
-                    (
-                        first.try_into().unwrap(),
-                        (last + 1 - first).try_into().unwrap(),
-                    )
-                };
-
-                Some(self.translate_fixed_point_arrays(first, count))
+            let (first, count) = if first == usize::MAX && last == usize::MIN {
+                assert!(count == 0);
+                (0, 0)
             } else {
-                None
+                (
+                    first.try_into().unwrap(),
+                    (last + 1 - first).try_into().unwrap(),
+                )
             };
+
+            Some(self.translate_fixed_point_arrays(first, count))
+        } else {
+            None
+        };
 
         gl21::DrawElements(mode, count, type_, indices);
 
-        self.restore_fog_state_values(fog_state_backup);
         if let Some(fixed_point_arrays_state_backup) = fixed_point_arrays_state_backup {
             self.restore_fixed_point_arrays(fixed_point_arrays_state_backup);
         }
@@ -1223,6 +1353,9 @@ impl GLES for GLES1OnGL2 {
     }
     unsafe fn ActiveTexture(&mut self, texture: GLenum) {
         gl21::ActiveTexture(texture)
+    }
+    unsafe fn IsTexture(&mut self, texture: GLuint) -> GLboolean {
+        gl21::IsTexture(texture)
     }
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) {
         assert!(target == gl21::TEXTURE_2D);
@@ -1491,6 +1624,16 @@ impl GLES for GLES1OnGL2 {
                 assert!(pname == gl21::COORD_REPLACE);
                 gl21::TexEnvf(target, pname, param)
             }
+            gl21::TEXTURE_2D => {
+                // This is not a valid TexEnvf target, but we're tolerating it
+                // for a Driver case.
+                assert_eq!(pname, gl21::TEXTURE_ENV_MODE);
+                log_dbg!(
+                    "Tolerating glTexEnvf(GL_TEXTURE_2D, TEXTURE_ENV_MODE, {})",
+                    param
+                );
+                gl21::TexEnvf(target, pname, param)
+            }
             _ => unimplemented!("TexEnvf target {}", target.to_string()),
         }
     }
@@ -1528,7 +1671,7 @@ impl GLES for GLES1OnGL2 {
                 gl21::TexEnvi(target, pname, param)
             }
             gl21::TEXTURE_2D => {
-                // This is not a valid TexEnvi target, but we a tolerating it
+                // This is not a valid TexEnvi target, but we're tolerating it
                 // for a Rayman 2 case.
                 assert!(pname == gl21::TEXTURE_ENV_MODE);
                 log_dbg!(
@@ -1761,6 +1904,15 @@ impl GLES for GLES1OnGL2 {
     ) {
         gl21::FramebufferTexture2DEXT(target, attachment, textarget, texture, level)
     }
+    unsafe fn GetFramebufferAttachmentParameterivOES(
+        &mut self,
+        target: GLenum,
+        attachment: GLenum,
+        pname: GLenum,
+        params: *mut GLint,
+    ) {
+        gl21::GetFramebufferAttachmentParameterivEXT(target, attachment, pname, params)
+    }
     unsafe fn GetRenderbufferParameterivOES(
         &mut self,
         target: GLenum,
@@ -1780,5 +1932,14 @@ impl GLES for GLES1OnGL2 {
     }
     unsafe fn GenerateMipmapOES(&mut self, target: GLenum) {
         gl21::GenerateMipmapEXT(target)
+    }
+    unsafe fn GetBufferParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
+        gl21::GetBufferParameteriv(target, pname, params)
+    }
+    unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid {
+        gl21::MapBuffer(target, access)
+    }
+    unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean {
+        gl21::UnmapBuffer(target)
     }
 }

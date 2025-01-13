@@ -11,6 +11,10 @@
 //! Being aware of this concept will make common types like `NSArray` and
 //! `NSString` easier to understand.
 
+use crate::dyld::{export_c_func, FunctionExports};
+use crate::objc::id;
+use crate::Environment;
+
 pub mod ns_array;
 pub mod ns_autorelease_pool;
 pub mod ns_bundle;
@@ -23,6 +27,7 @@ pub mod ns_dictionary;
 pub mod ns_enumerator;
 pub mod ns_error;
 pub mod ns_exception;
+pub mod ns_file_handle;
 pub mod ns_file_manager;
 pub mod ns_keyed_unarchiver;
 pub mod ns_locale;
@@ -39,10 +44,14 @@ pub mod ns_run_loop;
 pub mod ns_set;
 pub mod ns_string;
 pub mod ns_thread;
+pub mod ns_time_zone;
 pub mod ns_timer;
 pub mod ns_url;
+pub mod ns_url_connection;
+pub mod ns_url_request;
 pub mod ns_user_defaults;
 pub mod ns_value;
+pub mod ns_xml_parser;
 
 #[derive(Default)]
 pub struct State {
@@ -54,6 +63,7 @@ pub struct State {
     ns_null: ns_null::State,
     ns_run_loop: ns_run_loop::State,
     ns_string: ns_string::State,
+    ns_thread: ns_thread::State,
     ns_user_defaults: ns_user_defaults::State,
 }
 
@@ -86,6 +96,13 @@ impl crate::abi::GuestArg for NSRange {
     }
 }
 
+fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
+    let loc = range.location;
+    let len = range.length;
+    let string = format!("{{{}, {}}}", loc, len);
+    ns_string::from_rust_string(env, string)
+}
+
 pub type NSComparisonResult = NSInteger;
 pub const NSOrderedAscending: NSComparisonResult = -1;
 pub const NSOrderedSame: NSComparisonResult = 0;
@@ -110,3 +127,5 @@ fn hash_helper<T: std::hash::Hash>(hashable: &T) -> NSUInteger {
     let hash_u64: u64 = hasher.finish();
     (hash_u64 as u32) ^ ((hash_u64 >> 32) as u32)
 }
+
+pub const FUNCTIONS: FunctionExports = &[export_c_func!(NSStringFromRange(_))];

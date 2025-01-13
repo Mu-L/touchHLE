@@ -9,7 +9,7 @@
 #![allow(rustdoc::broken_intra_doc_links)] // https://github.com/rust-lang/rust/issues/83049
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::libc::errno::EBUSY;
+use crate::libc::errno::{EBUSY, EINVAL};
 use crate::mem::{ConstPtr, MutPtr, Ptr, SafeRead};
 use crate::{Environment, MutexId, PTHREAD_MUTEX_DEFAULT};
 
@@ -33,7 +33,7 @@ pub struct pthread_mutex_t {
     /// Magic number (must be [MAGIC_MUTEX])
     magic: u32,
     /// Unique mutex identifier, used in matching the mutex to it's host object.
-    mutex_id: MutexId,
+    pub mutex_id: MutexId,
 }
 unsafe impl SafeRead for pthread_mutex_t {}
 
@@ -108,7 +108,10 @@ pub fn pthread_mutex_init(
     0 // success
 }
 
-fn check_or_register_mutex(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) {
+fn check_or_register_mutex(
+    env: &mut Environment,
+    mutex: MutPtr<pthread_mutex_t>,
+) -> Result<(), i32> {
     let magic: u32 = env.mem.read(mutex.cast());
     // This is a statically-initialized mutex, we need to register it, and
     // change the magic number in the process.
@@ -118,22 +121,34 @@ fn check_or_register_mutex(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>
             mutex
         );
         pthread_mutex_init(env, mutex, Ptr::null());
+        Ok(())
+    } else if magic == MAGIC_MUTEX {
+        Ok(())
     } else {
-        // We should actually return an error if the magic number doesn't match,
-        // but this almost certainly indicates a memory corruption, so panicking
-        // is more useful.
-        assert_eq!(magic, MAGIC_MUTEX);
+        Err(EINVAL)
     }
 }
 
 pub fn pthread_mutex_lock(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) -> i32 {
-    check_or_register_mutex(env, mutex);
+    match check_or_register_mutex(env, mutex) {
+        Ok(_) => {}
+        Err(e) => {
+            return e;
+        }
+    };
     let mutex_data = env.mem.read(mutex);
-    env.lock_mutex(mutex_data.mutex_id).err().unwrap_or(0)
+    let mutex_id = mutex_data.mutex_id;
+    log_dbg!("About to lock mutex #{} ({:#x})", mutex_id, mutex.to_bits());
+    env.lock_mutex(mutex_id).err().unwrap_or(0)
 }
 
 pub fn pthread_mutex_trylock(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) -> i32 {
-    check_or_register_mutex(env, mutex);
+    match check_or_register_mutex(env, mutex) {
+        Ok(_) => {}
+        Err(e) => {
+            return e;
+        }
+    };
     let mutex_data = env.mem.read(mutex);
     if env.mutex_state.mutex_is_locked(mutex_data.mutex_id) {
         EBUSY
@@ -143,13 +158,29 @@ pub fn pthread_mutex_trylock(env: &mut Environment, mutex: MutPtr<pthread_mutex_
 }
 
 pub fn pthread_mutex_unlock(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) -> i32 {
-    check_or_register_mutex(env, mutex);
+    match check_or_register_mutex(env, mutex) {
+        Ok(_) => {}
+        Err(e) => {
+            return e;
+        }
+    };
     let mutex_data = env.mem.read(mutex);
-    env.unlock_mutex(mutex_data.mutex_id).err().unwrap_or(0)
+    let mutex_id = mutex_data.mutex_id;
+    log_dbg!(
+        "About to unlock mutex #{} ({:#x})",
+        mutex_id,
+        mutex.to_bits()
+    );
+    env.unlock_mutex(mutex_id).err().unwrap_or(0)
 }
 
 pub fn pthread_mutex_destroy(env: &mut Environment, mutex: MutPtr<pthread_mutex_t>) -> i32 {
-    check_or_register_mutex(env, mutex);
+    match check_or_register_mutex(env, mutex) {
+        Ok(_) => {}
+        Err(e) => {
+            return e;
+        }
+    };
     let mutex_id = env.mem.read(mutex).mutex_id;
     env.mem.write(
         mutex,

@@ -15,46 +15,50 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v3
-      with:
-        fetch-depth: 0 # touchHLE's git-describe versioning needs tag history
-    - name: Install clang-format
-      run: brew install clang-format
-    - name: Check formatting
-      run: dev-scripts/format.sh --check
-    - name: Get Submodules
-      run: git submodule update --init
-    - name: Install Boost
-      run: brew install boost
-    # This is the earliest point at which we can do linting: clippy will end up
-    # building dynarmic, which needs Boost, but we don't need LLVM until
-    # building tests.
-    - name: Lint
-      run: dev-scripts/lint.sh
-    - name: Try to get cached copy of LLVM
-      id: cache-llvm
-      uses: actions/cache@v3
-      with:
-        path: tests/llvm
-        key: llvm_12_0_0_macOS_x64
-    - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
-      name: Download LLVM
-      run: curl -L -O "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.0/clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz"
-    - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
-      name: Extract LLVM
-      run: tar -xf clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz && mkdir tests/llvm && mv clang+llvm-12.0.0-x86_64-apple-darwin/* tests/llvm
-    - name: Test
-      run: cargo test
-    - name: Build
-      run: cargo build --release && mv target/release/touchHLE .
-    - uses: actions/upload-artifact@v3
-      with:
-        name: touchHLE_macOS_x86_64
-        path: touchHLE
-    - uses: actions/upload-artifact@v3
-      with:
-        name: TestApp_built_on_macOS
-        path: tests/TestApp.app
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # touchHLE's git-describe versioning needs tag history
+      - name: Install clang-format
+        run: brew install clang-format
+      - name: Check formatting
+        run: dev-scripts/format.sh --check
+      - name: Get Submodules
+        run: git submodule update --init
+      - name: Install Boost
+        run: brew install boost
+      # This is the earliest point at which we can do linting: clippy will end up
+      # building dynarmic, which needs Boost, but we don't need LLVM until
+      # building tests.
+      - name: Lint
+        run: dev-scripts/lint.sh
+      - name: Try to get cached copy of LLVM
+        id: cache-llvm
+        uses: actions/cache@v3
+        with:
+          path: tests/llvm
+          key: llvm_12_0_0_macOS_x64
+      - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
+        name: Download LLVM
+        run: curl -L -O "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.0/clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz"
+      - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
+        name: Extract LLVM
+        run: tar -xf clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz && mkdir tests/llvm && mv clang+llvm-12.0.0-x86_64-apple-darwin/* tests/llvm
+      - name: Install x86_64 toolchain
+        run: rustup target add x86_64-apple-darwin
+      - name: Test
+        run: cargo test --target x86_64-apple-darwin
+      - name: Build
+        run: cargo build --target x86_64-apple-darwin --release
+      - name: Create .app bundle
+        run: cd dev-scripts && ./make-macos-bundle.sh ../target/x86_64-apple-darwin/release/touchHLE && mkdir touchHLE-dmg-src && mv touchHLE.app touchHLE-dmg-src/ && hdiutil create -volname touchHLE -srcfolder touchHLE-dmg-src touchHLE.dmg && mv touchHLE.dmg ..
+      - uses: actions/upload-artifact@v3
+        with:
+          name: touchHLE_macOS_x86_64
+          path: touchHLE.dmg
+      - uses: actions/upload-artifact@v3
+        with:
+          name: TestApp_built_on_macOS
+          path: tests/TestApp.app
 
   build-android:
 
@@ -76,7 +80,7 @@ jobs:
         key: boost_1_81_0
     - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
       name: Download Boost
-      run: curl -L -o boost_1_81_0.7z "https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.7z"
+      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
     - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
       name: Extract Boost
       run: 7z -ovendor x boost_1_81_0.7z && mv vendor/boost_1_81_0 vendor/boost
@@ -97,14 +101,37 @@ jobs:
     - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
       name: Extract Gradle
       run: 7z -ogradle x gradle-7.3-bin.zip
+    # We need to install the correct version of Android NDK manually
+    - name: Try to get a cached copy of Android NDK
+      id: cache-android-ndk
+      uses: actions/cache@v3
+      with:
+        path: android-ndk
+        key: android-ndk-r25c
+    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+      name: Download Android NDK
+      run: curl -L -o android-ndk-r25c-linux.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+      name: Extract Android NDK
+      run: 7z -oandroid-ndk x android-ndk-r25c-linux.zip
+    - name: Link Android NDK
+      run: ln -s $PWD'/android-ndk/android-ndk-r25c' $ANDROID_SDK_ROOT'/ndk/25.2.9519653'
     # Why isn't there a command for this?
     - name: Generate local.properties file
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
-    # Let's not even bother with linting (would need to build for host, not just
-    # Android, which makes things more complicated) or trying to run tests
-    # (would have to run on Android 😰).
+    - name: Lint
+      run: dev-scripts/lint.sh ndk -t arm64-v8a
+      env:
+        # The version should match the ndkVersion defined in `android\app\build.gradle`
+        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
+        ANDROID_NDK: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
+        ANDROID_NDK_HOME: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
+    # Don't attempt to run tests (can't run on Android).
     - name: Build for Android
       run: cd android && ../gradle/gradle-7.3/bin/gradle assembleRelease && mv app/build/outputs/apk/release/app-release.apk ../touchHLE.apk
+      env:
+        # The version should match the ndkVersion defined in `android\app\build.gradle`
+        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
     - uses: actions/upload-artifact@v3
       with:
         name: touchHLE_Android_AArch64
@@ -132,7 +159,7 @@ jobs:
         key: boost_1_81_0
     - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
       name: Download Boost
-      run: curl -L -o boost_1_81_0.7z "https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.7z"
+      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
     - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
       name: Extract Boost
       run: 7z -ovendor x boost_1_81_0.7z && ren vendor\boost_1_81_0 boost

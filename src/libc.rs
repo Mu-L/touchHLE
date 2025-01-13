@@ -12,6 +12,7 @@
 mod generic_char;
 
 pub mod clocale;
+pub mod crypto;
 pub mod ctype;
 pub mod cxxabi;
 pub mod dirent;
@@ -19,11 +20,15 @@ pub mod dlfcn;
 pub mod errno;
 pub mod ifaddrs;
 pub mod keymgr;
+pub mod mach_host;
+pub mod mach_init;
+pub mod mach_semaphore;
 pub mod mach_thread_info;
 pub mod mach_time;
 pub mod math;
 pub mod mmap;
 pub mod net;
+pub mod netdb;
 pub mod posix_io;
 pub mod pthread;
 pub mod sched;
@@ -44,8 +49,9 @@ pub mod wchar;
 pub struct State {
     dirent: dirent::State,
     keymgr: keymgr::State,
+    mach_semaphore: mach_semaphore::State,
     posix_io: posix_io::State,
-    pthread: pthread::State,
+    pub pthread: pthread::State,
     pub semaphore: semaphore::State,
     stdlib: stdlib::State,
     string: string::State,

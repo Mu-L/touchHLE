@@ -13,6 +13,8 @@ use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::objc::{objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
+type CGInterpolationQuality = i32;
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -41,6 +43,8 @@ pub(super) struct CGContextHostObject {
     pub(super) rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     /// Current transform.
     pub(super) transform: CGAffineTransform,
+    // TODO: keep more states saved once they are implemented
+    pub(super) state_stack: Vec<((CGFloat, CGFloat, CGFloat, CGFloat), CGAffineTransform)>,
 }
 impl HostObject for CGContextHostObject {}
 
@@ -141,6 +145,32 @@ pub fn CGContextDrawImage(
     cg_bitmap_context::draw_image(env, context, rect, image);
 }
 
+fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
+    let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
+    host_obj
+        .state_stack
+        .push((host_obj.rgb_fill_color, host_obj.transform));
+}
+
+fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
+    let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
+    let state = host_obj.state_stack.pop().unwrap();
+    host_obj.rgb_fill_color = state.0;
+    host_obj.transform = state.1;
+}
+
+fn CGContextSetInterpolationQuality(
+    _env: &mut Environment,
+    context: CGContextRef,
+    quality: CGInterpolationQuality,
+) {
+    log!(
+        "TODO: CGContextSetInterpolationQuality({:?}, {:?})",
+        context,
+        quality
+    );
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextRetain(_)),
     export_c_func!(CGContextRelease(_)),
@@ -154,4 +184,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextScaleCTM(_, _, _)),
     export_c_func!(CGContextTranslateCTM(_, _, _)),
     export_c_func!(CGContextDrawImage(_, _, _)),
+    export_c_func!(CGContextSaveGState(_)),
+    export_c_func!(CGContextRestoreGState(_)),
+    export_c_func!(CGContextSetInterpolationQuality(_, _)),
 ];

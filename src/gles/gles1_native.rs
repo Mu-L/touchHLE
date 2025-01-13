@@ -86,6 +86,9 @@ impl GLES for GLES1Native {
     unsafe fn GetTexEnviv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
         gles11::GetTexEnviv(target, pname, params)
     }
+    unsafe fn GetTexEnvfv(&mut self, target: GLenum, pname: GLenum, params: *mut GLfloat) {
+        gles11::GetTexEnvfv(target, pname, params)
+    }
     unsafe fn GetPointerv(&mut self, pname: GLenum, params: *mut *const GLvoid) {
         // The second argument to glGetPointerv must be a mutable pointer,
         // but gl_generator generates the wrong signature by mistake, see
@@ -94,6 +97,9 @@ impl GLES for GLES1Native {
     }
     unsafe fn Hint(&mut self, target: GLenum, mode: GLenum) {
         gles11::Hint(target, mode)
+    }
+    unsafe fn Finish(&mut self) {
+        gles11::Finish()
     }
     unsafe fn Flush(&mut self) {
         gles11::Flush()
@@ -112,6 +118,9 @@ impl GLES for GLES1Native {
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum) {
         gles11::BlendFunc(sfactor, dfactor)
     }
+    unsafe fn BlendEquationOES(&mut self, mode: GLenum) {
+        gles11::BlendEquationOES(mode);
+    }
     unsafe fn ColorMask(
         &mut self,
         red: GLboolean,
@@ -120,6 +129,12 @@ impl GLES for GLES1Native {
         alpha: GLboolean,
     ) {
         gles11::ColorMask(red, green, blue, alpha)
+    }
+    unsafe fn ClipPlanef(&mut self, plane: GLenum, equation: *const GLfloat) {
+        gles11::ClipPlanef(plane, equation)
+    }
+    unsafe fn ClipPlanex(&mut self, plane: GLenum, equation: *const GLfixed) {
+        gles11::ClipPlanex(plane, equation)
     }
     unsafe fn CullFace(&mut self, mode: GLenum) {
         gles11::CullFace(mode)
@@ -159,6 +174,15 @@ impl GLES for GLES1Native {
     }
     unsafe fn LineWidthx(&mut self, val: GLfixed) {
         gles11::LineWidthx(val)
+    }
+    unsafe fn StencilFunc(&mut self, func: GLenum, ref_: GLint, mask: GLuint) {
+        gles11::StencilFunc(func, ref_, mask);
+    }
+    unsafe fn StencilOp(&mut self, sfail: GLenum, dpfail: GLenum, dppass: GLenum) {
+        gles11::StencilOp(sfail, dpfail, dppass);
+    }
+    unsafe fn StencilMask(&mut self, mask: GLuint) {
+        gles11::StencilMask(mask);
     }
 
     // Points
@@ -209,8 +233,14 @@ impl GLES for GLES1Native {
     unsafe fn LightModelf(&mut self, pname: GLenum, param: GLfloat) {
         gles11::LightModelf(pname, param)
     }
+    unsafe fn LightModelx(&mut self, pname: GLenum, param: GLfixed) {
+        gles11::LightModelx(pname, param)
+    }
     unsafe fn LightModelfv(&mut self, pname: GLenum, params: *const GLfloat) {
         gles11::LightModelfv(pname, params)
+    }
+    unsafe fn LightModelxv(&mut self, pname: GLenum, params: *const GLfixed) {
+        gles11::LightModelxv(pname, params)
     }
     unsafe fn Materialf(&mut self, face: GLenum, pname: GLenum, param: GLfloat) {
         gles11::Materialf(face, pname, param)
@@ -226,6 +256,9 @@ impl GLES for GLES1Native {
     }
 
     // Buffers
+    unsafe fn IsBuffer(&mut self, buffer: GLuint) -> GLboolean {
+        gles11::IsBuffer(buffer)
+    }
     unsafe fn GenBuffers(&mut self, n: GLsizei, buffers: *mut GLuint) {
         gles11::GenBuffers(n, buffers)
     }
@@ -377,6 +410,9 @@ impl GLES for GLES1Native {
     }
     unsafe fn ActiveTexture(&mut self, texture: GLenum) {
         gles11::ActiveTexture(texture)
+    }
+    unsafe fn IsTexture(&mut self, texture: GLuint) -> GLboolean {
+        gles11::IsTexture(texture)
     }
     unsafe fn BindTexture(&mut self, target: GLenum, texture: GLuint) {
         gles11::BindTexture(target, texture)
@@ -669,6 +705,15 @@ impl GLES for GLES1Native {
     ) {
         gles11::FramebufferTexture2DOES(target, attachment, textarget, texture, level)
     }
+    unsafe fn GetFramebufferAttachmentParameterivOES(
+        &mut self,
+        target: GLenum,
+        attachment: GLenum,
+        pname: GLenum,
+        params: *mut GLint,
+    ) {
+        gles11::GetFramebufferAttachmentParameterivOES(target, attachment, pname, params)
+    }
     unsafe fn GetRenderbufferParameterivOES(
         &mut self,
         target: GLenum,
@@ -688,5 +733,14 @@ impl GLES for GLES1Native {
     }
     unsafe fn GenerateMipmapOES(&mut self, target: GLenum) {
         gles11::GenerateMipmapOES(target)
+    }
+    unsafe fn GetBufferParameteriv(&mut self, target: GLenum, pname: GLenum, params: *mut GLint) {
+        gles11::GetBufferParameteriv(target, pname, params)
+    }
+    unsafe fn MapBufferOES(&mut self, target: GLenum, access: GLenum) -> *mut GLvoid {
+        gles11::MapBufferOES(target, access)
+    }
+    unsafe fn UnmapBufferOES(&mut self, target: GLenum) -> GLboolean {
+        gles11::UnmapBufferOES(target)
     }
 }
